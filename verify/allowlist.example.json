@@ -1,0 +1,23 @@
+[
+  {
+    "_comment": "verify_cost.py --allowlist 예시. 규칙 = service(Cost Explorer SERVICE 값, glob) + usage_type_pattern(USAGE_TYPE glob, 대소문자 무시) + max_usd_per_day(일별 상한) + reason(필수). '_'로 시작하는 키만 있는 항목은 주석으로 무시된다. 세금·크레딧·환불은 RECORD_TYPE=Usage 필터로 이미 빠지므로 규칙이 필요 없다. 이 스크립트의 Cost Explorer API 요금(USE1-APIRequest, $0.01/요청)은 내장 규칙으로 항상 허용된다. 상한을 넘으면 그 줄은 RESIDUAL로 표시된다. 보수적으로 유지할 것: 규칙 하나가 진짜 잔여 리소스를 가릴 수 있다."
+  },
+  {
+    "service": "Amazon Route 53",
+    "usage_type_pattern": "HostedZone",
+    "max_usd_per_day": 0.5,
+    "reason": "호스팅 영역 월 요금($0.50/영역)은 매월 1일(또는 생성일)에 한 번에 붙는다. 검사 구간이 1일에 걸쳤을 때 영역 1개까지만 허용. 남아 있는 영역은 해지 전에 지워야 하므로 매일 반복되면 허용 목록이 아니라 잔여물로 처리할 것."
+  },
+  {
+    "service": "Amazon Simple Storage Service",
+    "usage_type_pattern": "*EarlyDelete*",
+    "max_usd_per_day": 1.0,
+    "reason": "Glacier/IA 등 최소 보관 기간 전에 지운 객체의 조기 삭제 수수료(EarlyDelete-*). 삭제한 날 한 번만 붙는 일회성 요금이며 정리가 UTC 자정을 넘겨 끝났을 때 D+1에 보일 수 있다."
+  },
+  {
+    "service": "Amazon Simple Storage Service",
+    "usage_type_pattern": "*Requests-Tier*",
+    "max_usd_per_day": 0.05,
+    "reason": "정리 직후 남은 S3 요청 요금(삭제·목록 호출) 꼬리. 아주 작은 금액만 허용."
+  }
+]
