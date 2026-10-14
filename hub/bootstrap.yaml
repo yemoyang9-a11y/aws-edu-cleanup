@@ -1,0 +1,298 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  edu-cleanup bootstrap (stack name MUST be edu-bootstrap). Installs EduCleanupRole so the company
+  hub (cleanup) account can clean this standalone training account after the course. Keep this stack
+  until the account is closed. Requires CAPABILITY_NAMED_IAM.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "허브(정리) 계정 연결 - 링크로 미리 채워집니다"
+        Parameters:
+          - HubPrincipalArn
+          - ExternalId
+      - Label:
+          default: "계정 별칭 (선택)"
+        Parameters:
+          - AccountAlias
+    ParameterLabels:
+      HubPrincipalArn:
+        default: "허브 오케스트레이터 IAM 역할/사용자 ARN"
+      ExternalId:
+        default: "ExternalId (NoEcho라 링크로 채워지지 않으면 운영자가 준 값을 붙여넣기)"
+      AccountAlias:
+        default: "계정 별칭 (예: edu-2026-10-01, 'prod' 금지, 비우면 건너뜀)"
+
+Parameters:
+  HubPrincipalArn:
+    Type: String
+    Description: >-
+      ARN of the hub IAM role or user that may assume EduCleanupRole,
+      e.g. arn:aws:iam::123456789012:role/EduHubOrchestrator
+    AllowedPattern: '^arn:aws(-cn|-us-gov)?:iam::[0-9]{12}:(role|user)/[\w+=,.@/-]+$'
+    ConstraintDescription: must be an IAM role or user ARN (arn:aws:iam::<12-digit account>:role/<name>)
+  ExternalId:
+    Type: String
+    NoEcho: true
+    Description: Shared ExternalId the hub passes on AssumeRole (8-1224 chars, letters, digits and +=,.@:/_-)
+    MinLength: 8
+    MaxLength: 1224
+    AllowedPattern: '^[\w+=,.@:/-]+$'
+    ConstraintDescription: 8-1224 characters from letters, digits and +=,.@:/_-
+  AccountAlias:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional IAM account alias to create if the account has none (e.g. edu-2026-10-01).
+      Must not contain "prod". Leave empty to skip.
+    AllowedPattern: '^$|^(?!.*prod)[a-z0-9]([a-z0-9]|-(?!-)){1,61}[a-z0-9]$'
+    ConstraintDescription: empty, or 3-63 lowercase letters/digits/single hyphens that do not contain "prod"
+
+Conditions:
+  HasAlias: !Not [!Equals [!Ref AccountAlias, ""]]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # The "master key" lock: only the hub principal (with the ExternalId) can open it.
+  # ---------------------------------------------------------------------------
+  EduCleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EduCleanupRole
+      Description: edu-cleanup hub orchestrator role (AdministratorAccess). Do not modify or delete.
+      MaxSessionDuration: 43200
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # 1) The hub account, but only the one hub principal and only with the ExternalId.
+          #    Principal is the account root (not the role ARN) so the trust survives the hub
+          #    role being deleted and recreated with the same name.
+          - Sid: HubOrchestrator
+            Effect: Allow
+            Principal:
+              AWS: !Sub
+                - "arn:${AWS::Partition}:iam::${HubAccountId}:root"
+                - HubAccountId: !Select [4, !Split [":", !Ref HubPrincipalArn]]
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+              ArnEquals:
+                aws:PrincipalArn: !Ref HubPrincipalArn
+          # 2) CloudFormation itself: cfn_predelete passes this role as RoleARN to DeleteStack
+          #    when a stack's own service role has already been deleted.
+          - Sid: CloudFormationStackDeletion
+            Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: managed-by
+          Value: edu-cleanup
+        - Key: edu-protected
+          Value: "true"
+
+  # ---------------------------------------------------------------------------
+  # Guardrail for course admins to attach to student groups/users. NOT attached here.
+  # iam:*Role* also covers iam:PassRole, so students cannot hand the admin role to
+  # CloudFormation/Lambda/EC2 to escalate their own privileges.
+  # ---------------------------------------------------------------------------
+  EduProtectCleanupRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: EduProtectCleanupRole
+      Description: >-
+        Attach to student groups. Denies changing or deleting EduCleanupRole, the edu-bootstrap
+        stack and this policy itself.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyCleanupRoleTampering
+            Effect: Deny
+            Action:
+              - iam:*Role*
+              - iam:*RolePolicy*
+              - iam:*RolePolicies*
+            Resource: !GetAtt EduCleanupRole.Arn
+          - Sid: DenyBootstrapStackChanges
+            Effect: Deny
+            Action:
+              - cloudformation:DeleteStack
+              - cloudformation:UpdateStack
+              - cloudformation:CreateChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:UpdateTerminationProtection
+              - cloudformation:SetStackPolicy
+            Resource: !Sub "arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/edu-bootstrap*/*"
+          - Sid: DenyDetachingThisGuardrail
+            Effect: Deny
+            Action:
+              - iam:DetachUserPolicy
+              - iam:DetachGroupPolicy
+              - iam:DetachRolePolicy
+            Resource: "*"
+            Condition:
+              ArnEquals:
+                iam:PolicyARN: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/EduProtectCleanupRole"
+          - Sid: DenyEditingThisGuardrail
+            Effect: Deny
+            Action:
+              - iam:CreatePolicyVersion
+              - iam:DeletePolicy
+              - iam:DeletePolicyVersion
+              - iam:SetDefaultPolicyVersion
+            Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/EduProtectCleanupRole"
+
+  # ---------------------------------------------------------------------------
+  # Optional account alias (there is no native CloudFormation resource for it).
+  # Names start with edu-bootstrap so cleanup filters can recognise them.
+  # ---------------------------------------------------------------------------
+  AliasFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: HasAlias
+    Properties:
+      RoleName: edu-bootstrap-alias-fn
+      Description: Lets the edu-bootstrap custom resource create the IAM account alias.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: account-alias
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:ListAccountAliases
+                  - iam:CreateAccountAlias
+                Resource: "*"
+
+  AliasFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasAlias
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: /aws/lambda/edu-bootstrap-account-alias
+      RetentionInDays: 14
+
+  AliasFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasAlias
+    DependsOn: AliasFunctionLogGroup
+    Properties:
+      FunctionName: edu-bootstrap-account-alias
+      Description: edu-bootstrap custom resource - creates the IAM account alias if none exists
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt AliasFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import threading
+          import urllib.request
+
+          import boto3
+
+
+          def send(event, context, status, reason, data):
+              stream = getattr(context, "log_stream_name", "") or "?"
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": (reason or "See CloudWatch log stream " + stream)[:3500],
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or "edu-account-alias",
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {},
+              }).encode("utf-8")
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(
+                          event["ResponseURL"], data=body, method="PUT",
+                          headers={"Content-Type": "", "Content-Length": str(len(body))})
+                      urllib.request.urlopen(req, timeout=20).read()
+                      return True
+                  except Exception as e:  # keep trying; never raise
+                      print("response attempt %d failed: %s" % (attempt + 1, e))
+              return False
+
+
+          def handler(event, context):
+              print(json.dumps({k: v for k, v in event.items() if k != "ResponseURL"}))
+              sent = []
+              lock = threading.Lock()
+
+              def respond(status, reason="", data=None):
+                  with lock:
+                      if sent:
+                          return
+                      sent.append(status)
+                  send(event, context, status, reason, data)
+
+              # Safety net: answer before the Lambda timeout so the stack never hangs.
+              left = context.get_remaining_time_in_millis() / 1000.0 if context else 60.0
+              timer = threading.Timer(max(left - 5.0, 1.0), respond,
+                                      args=("FAILED", "Timed out while handling the account alias"))
+              timer.daemon = True
+              timer.start()
+              try:
+                  data = {"Alias": "", "Action": "none"}
+                  if event.get("RequestType") in ("Create", "Update"):
+                      props = event.get("ResourceProperties") or {}
+                      alias = str(props.get("AccountAlias") or "").strip()
+                      iam = boto3.client("iam")
+                      existing = iam.list_account_aliases().get("AccountAliases") or []
+                      if "prod" in alias.lower():
+                          raise ValueError("alias must not contain 'prod'")
+                      if not alias:
+                          data = {"Alias": existing[0] if existing else "", "Action": "skipped-empty"}
+                      elif existing:
+                          same = existing[0] == alias
+                          data = {"Alias": existing[0], "Action": "already-set" if same else "kept-existing"}
+                      else:
+                          iam.create_account_alias(AccountAlias=alias)
+                          data = {"Alias": alias, "Action": "created"}
+                  respond("SUCCESS", "", data)
+              except Exception as e:
+                  respond("FAILED", "%s: %s" % (type(e).__name__, e))
+              finally:
+                  timer.cancel()
+      Tags:
+        - Key: managed-by
+          Value: edu-cleanup
+
+  AccountAliasResource:
+    Type: Custom::AccountAlias
+    Condition: HasAlias
+    Properties:
+      ServiceToken: !GetAtt AliasFunction.Arn
+      ServiceTimeout: 300  # fail after 5 min instead of 1 h if no response ever arrives
+      AccountAlias: !Ref AccountAlias
+
+Outputs:
+  RoleArn:
+    Description: ARN of EduCleanupRole (register this account in the hub registry)
+    Value: !GetAtt EduCleanupRole.Arn
+  ProtectPolicyArn:
+    Description: Attach this managed policy to student groups to protect EduCleanupRole
+    Value: !Ref EduProtectCleanupRolePolicy
+  AccountAlias:
+    Condition: HasAlias
+    Description: Effective account alias (an existing different alias is kept, not replaced)
+    Value: !GetAtt AccountAliasResource.Alias
+  AccountAliasAction:
+    Condition: HasAlias
+    Description: created | already-set | kept-existing
+    Value: !GetAtt AccountAliasResource.Action

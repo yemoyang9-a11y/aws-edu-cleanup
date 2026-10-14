@@ -1,0 +1,17 @@
+{
+  "cohort": "2026-10",
+  "external_id": "CHANGE-ME-LONG-RANDOM",
+  "regions": ["ap-northeast-2", "us-east-1"],
+  "max_parallel": 10,
+  "killswitch": {
+    "TokenThreshold": 2000000,
+    "PeriodMinutes": 5,
+    "TargetMode": "ALL_IAM_USERS",
+    "TargetGroupName": "",
+    "ExemptUserNames": "",
+    "NotificationEmail": ""
+  },
+  "accounts": [
+    {"account_id": "111111111111", "alias": "edu-2026-10-01", "note": ""}
+  ]
+}
