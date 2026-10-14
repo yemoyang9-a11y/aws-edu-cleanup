@@ -1,0 +1,7 @@
+# Runtime needs only boto3/botocore (preinstalled in AWS CloudShell). These are for tests/linting.
+boto3>=1.43
+moto[server]>=5
+pytest
+PyYAML
+cfn-lint
+shellcheck-py
