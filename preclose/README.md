@@ -1,8 +1,11 @@
 # preclose — 계정 해지 직전 점검 (모듈 5)
 
-aws-nuke로 정리한 **뒤**, 루트 콘솔에서 계정을 해지하기 **직전**에 실행한다.
+aws-nuke로 정리한 **뒤**, 계정을 해지하기 **직전**에 실행한다.
 해지 후에도 청구되거나 aws-nuke가 처리하지 않는 항목을 찾고, `--apply`를 주면 API로 고칠 수 있는 것은 고친다.
 기본은 dry-run(조회만)이다.
+
+교육 계정은 보통 **리셀러 조직(AWS Organizations)의 멤버 계정**이다. 스크립트는 `organizations:DescribeOrganization`으로
+소속을 확인해 `organization` INFO(멤버/독립/알 수 없음)를 남기고, 해지 안내(reminder)를 그에 맞게 바꾼다.
 
 ```
 aws-nuke  →  preclose_check.py (dry-run)  →  preclose_check.py --apply  →  수동 체크리스트  →  루트 콘솔에서 해지
@@ -12,6 +15,7 @@ aws-nuke  →  preclose_check.py (dry-run)  →  preclose_check.py --apply  → 
 
 | 점검 | 등급 | 왜 중요한가 | `--apply` 동작 |
 |---|---|---|---|
+| 조직 소속 (`organizations:DescribeOrganization`) | INFO | 멤버 계정이면 해지·청구·환불 문의가 관리 계정(리셀러)을 거친다. 표시: `member of org <ID>, management account <ID> (<이메일 도메인>)` / `standalone` / `unknown`(권한 없음 등) | 없음 |
 | Marketplace 구매 계약 (`marketplace-agreement:SearchAgreements`, us-east-1) | BLOCKER | 계정을 해지해도 구독이 자동 취소되지 않고, aws-nuke는 Marketplace를 지원하지 않는다 | `CancelAgreement`(선결제 계약 먼저). 판매자만 취소할 수 있는 계약이면 `failed`로 기록하고 판매자/Support 문의를 안내한다 |
 | CloudTrail 트레일 (리전별 `DescribeTrails`, ARN으로 중복 제거) | BLOCKER | 사용자가 만든 트레일은 해지 후에도 남아 이벤트를 계속 전달한다(다른 계정 버킷이면 과금 지속) | 홈 리전에서 `DeleteTrail` |
 | CloudTrail Lake 이벤트 데이터 스토어 | BLOCKER | 수집·보존 요금이 붙고, aws-nuke에는 이 리소스 타입이 없다 | 종료 보호 해제 → `DeleteEventDataStore`(페더레이션이 켜져 있으면 먼저 끔) |
@@ -24,9 +28,12 @@ aws-nuke  →  preclose_check.py (dry-run)  →  preclose_check.py --apply  → 
 | Route 53 등록 도메인 | WARN | 자동 갱신으로 연 단위 요금이 청구될 수 있다 | `DisableDomainAutoRenew` |
 | 루트 액세스 키 | WARN | 유출되면 무제한 과금·해킹으로 이어진다. IAM 권한으로는 지울 수 없다 | 없음. 루트로 로그인해 직접 삭제한다 |
 | 계정 별칭 | INFO | 해지 전에 지워야 같은 별칭을 다시 쓸 수 있다. 단, 지우면 aws-nuke를 다시 돌릴 수 없다(aws-nuke는 별칭이 필수) | `--apply --delete-alias`일 때만 삭제한다(BLOCKER나 "확인 불가" 점검이 남아 있으면 보류) |
-| 고정 안내 | INFO | 루트 이메일 재사용 불가, 해지는 콘솔에서만 가능, 최종 청구서는 다음 달, Support 플랜 | 없음 |
+| 해지 안내 (`closure_reminder`) | INFO | 독립 계정: 루트 이메일 재사용 불가, 해지는 루트 콘솔에서만, 최종 청구서는 다음 달, Support 플랜. 멤버 계정: 루트 콘솔 또는 관리 계정(리셀러)이 해지(SCP가 막으면 리셀러에 요청), 해지 후 90일간 조직에 남음, 요금·최종 청구는 리셀러 청구서, 청구·환불 문의는 리셀러 경유, 루트 이메일 재사용 불가 | 없음 |
 
 권한이 없거나(AccessDenied), 리전이 꺼져 있거나, 서비스를 지원하지 않아 확인하지 못한 점검은 `WARN "확인 불가"`로 남기고 나머지 점검을 계속한다.
+단, 조직 SCP가 막은 점검(오류 메시지에 `service control policy`가 있거나, 멤버 계정에서 Marketplace·Savings Plans가 AccessDenied)은
+`WARN "blocked by organization policy (SCP) - check with the reseller"`로 남기고 `summary.checks_blocked_by_org`에 모은다.
+계정 안에서는 풀 수 없으므로 BLOCKER도 "확인 불가"도 아니다(별칭 삭제·`ready_to_close`를 막지 않음). 해당 항목은 리셀러에게 확인한다.
 별칭에 `prod`가 들어 있으면 다른 계정일 수 있으므로 `--apply`는 아무것도 바꾸지 않고 종료한다(exit 2).
 
 ### 휴지통 비우기 (`--purge-recycle-bin`)
@@ -43,7 +50,7 @@ aws-nuke  →  preclose_check.py (dry-run)  →  preclose_check.py --apply  → 
 1. 교육 종료 → aws-nuke 실행(필요하면 여러 번)
 2. **preclose dry-run** → 결과 확인
 3. **preclose `--apply`** (마지막 실행 때 `--delete-alias`) → exit 0이 될 때까지 반복
-4. 아래 수동 체크리스트를 마친 뒤 루트 콘솔에서 해지
+4. 아래 수동 체크리스트를 마친 뒤 루트 콘솔에서 해지(멤버 계정이고 SCP로 막히면 리셀러에 해지 요청)
 
 exit 코드: `0` 남은 BLOCKER 없음(해지 가능) · `1` BLOCKER 남음(해지 보류) · `2` 실행 오류.
 `--apply` 없이 실행하면 고칠 수 있는 BLOCKER도 `planned`로 남으므로, 결과가 깨끗한 계정이 아니라면 dry-run의 exit 코드는 1이다.
@@ -207,9 +214,10 @@ cat > "$D/preclose/preclose_check.py" <<'PRECLOSE_EOF'
 #!/usr/bin/env python3
 """preclose_check.py - pre-closure check (edu-cleanup module 5: preclose).
 
-Run AFTER aws-nuke and BEFORE the operator closes the standalone account in the
-root console. It finds things that keep billing after closure (or that aws-nuke
-does not handle) and, with --apply, fixes whatever can be fixed through the API.
+Run AFTER aws-nuke and BEFORE the account is closed. It finds things that keep billing after
+closure (or that aws-nuke does not handle) and, with --apply, fixes whatever can be fixed through
+the API. It also detects AWS Organizations membership (training accounts are usually member
+accounts of a reseller's organization) and words the closure reminders accordingly.
 
 Dry-run by default. Exit codes: 0 = no BLOCKER left, 1 = BLOCKER(s) remain, 2 = error.
 """
@@ -232,7 +240,7 @@ BLOCKER, WARN, INFO = "BLOCKER", "WARN", "INFO"
 SEVERITIES = (BLOCKER, WARN, INFO)
 ACTIONS = ("none", "planned", "done", "failed")
 GLOBAL = "global"
-# Marketplace Agreement, Shield, Route 53 Domains, IAM and the Account API are served from us-east-1.
+# Marketplace Agreement, Shield, Route 53 Domains, IAM, Organizations and the Account API are served from us-east-1.
 HOME_REGION = "us-east-1"
 
 COMMIT_ADVICE = "약정 기간이 끝날 때까지 해지 후에도 청구됨(API로 취소 불가) - AWS Support에 문의"
@@ -263,15 +271,47 @@ OTHER_RESERVATIONS = (
      "ReservedNodeId", "NodeCount", "NodeType", "Redshift 예약 노드"),
 )
 
+ROOT_EMAIL_REMINDER = ("root-email", "루트 이메일은 해지 후 다른 계정에 재사용할 수 없음 - 재사용하려면 해지 전에 루트 이메일을 바꿀 것")
+# Standalone account (not in any AWS Organizations organization).
 REMINDERS = (
-    ("root-email", "루트 이메일은 해지 후 다른 계정에 재사용할 수 없음 - 재사용하려면 해지 전에 루트 이메일을 바꿀 것"),
+    ROOT_EMAIL_REMINDER,
     ("closure-console-only", "독립 계정 해지는 API가 없음 - 루트 사용자로 콘솔 로그인 후 Account > Close account"),
     ("final-invoice", "해지 전 사용분은 다음 달 초 최종 청구서로 청구됨(정상) - 90일 안에 재개하면 남은 리소스 과금도 재개"),
     ("support-plan", "유료 Support 플랜을 쓰고 있으면 해지 전에 Basic으로 변경(루트, 콘솔)"),
 )
+# Member account of someone else's organization (e.g. a reseller's). AWS docs: a member account can be
+# closed by its root user (Account page) or by the management account (CloseAccount), unless an SCP denies
+# account:CloseAccount; it stays in the organization (SUSPENDED) for the 90-day post-closure period; the
+# management account pays all member-account charges (consolidated billing).
+MEMBER_REMINDERS = (
+    ROOT_EMAIL_REMINDER,
+    ("closure-member", "조직 멤버 계정 해지: 루트로 콘솔 로그인 후 Account > Close account, 또는 관리 계정(리셀러)이 "
+                       "Organizations CloseAccount로 해지. 조직 SCP가 account:CloseAccount를 막으면 루트로도 해지 불가 - 리셀러에 해지 요청"),
+    ("post-closure-org", "해지 후 90일(post-closure period) 동안 SUSPENDED 상태로 조직에 남음 - 이 기간에만 재개 가능, "
+                         "재개하면 남은 리소스 과금도 재개. 90일 뒤 영구 해지되고 조직에서 빠짐"),
+    ("final-invoice-member", "해지 전 사용분은 다음 달 청구에 포함되며 멤버 계정 요금은 관리 계정(리셀러)의 청구서로 감 - "
+                             "회사 청구는 리셀러 정산으로 확인"),
+    ("billing-via-reseller", "이 계정에서는 SCP로 비용/청구 화면이 막혀 있을 수 있음 - 요금·환불·면제 문의(예: Bedrock 과다 사용)는 "
+                             "리셀러를 통해 진행"),
+    ("support-plan-member", "이 계정에서 유료 Support 플랜을 직접 가입한 경우에만: 해지 전에 Basic으로 변경(리셀러 지원 계약이면 해당 없음)"),
+)
+# Membership could not be determined (organizations:DescribeOrganization denied or failed).
+UNKNOWN_ORG_REMINDERS = (
+    ROOT_EMAIL_REMINDER,
+    ("closure-unknown-org", "조직 소속 여부 확인 불가 - 루트로 콘솔 로그인 후 Account > Close account. 조직 멤버 계정이면 "
+                            "관리 계정도 해지할 수 있고, SCP로 막혀 있으면 관리 계정 측에 해지 요청"),
+    ("final-invoice", "해지 전 사용분은 다음 달 초 청구됨(조직 멤버면 관리 계정 청구서로 감) - 90일 안에 재개하면 남은 리소스 과금도 재개"),
+    ("support-plan", "유료 Support 플랜을 직접 쓰고 있으면 해지 전에 Basic으로 변경(루트, 콘솔)"),
+)
+
+ORG_STANDALONE, ORG_MEMBER, ORG_MANAGEMENT, ORG_UNKNOWN = "standalone", "member", "management", "unknown"
+# Billing-side checks that an organization SCP typically blocks in member accounts.
+ORG_SENSITIVE_CHECKS = {"marketplace_agreement", "savings_plan"}
+ORG_BLOCKED_DETAIL = ("blocked by organization policy (SCP) - check with the reseller | 조직 정책(SCP)으로 차단되어 "
+                      "확인 불가 - 리셀러(관리 계정)에게 해당 항목 확인 요청")
 
 ALL_CHECKS = (
-    "marketplace", "cloudtrail_trails", "cloudtrail_lake", "recycle_bin", "ec2_reserved",
+    "organization", "marketplace", "cloudtrail_trails", "cloudtrail_lake", "recycle_bin", "ec2_reserved",
     "other_reserved", "savings_plans", "bedrock_provisioned", "shield", "route53_domains",
     "root_access_keys", "account_alias", "reminders",
 )
@@ -409,6 +449,8 @@ class PreClose:
         self._clients: Dict[Tuple[str, str], Any] = {}
         self.findings: List[Dict[str, Any]] = []
         self.checks_failed: List[str] = []
+        self.checks_blocked_by_org: List[str] = []
+        self.org: Optional[Dict[str, Any]] = None
         self.aliases: Optional[List[str]] = None
         self._aliases_tried = False
 
@@ -432,6 +474,13 @@ class PreClose:
         except Exception as exc:  # noqa: BLE001 - one failing check must never stop the others
             if not isinstance(exc, (ClientError, BotoCoreError)):
                 log(traceback.format_exc())
+            if self._blocked_by_org(check, exc):
+                # Not fixable from inside the account: a WARN for the reseller, not a "could not check" failure
+                # (otherwise --delete-alias and ready_to_close would be held forever in member accounts).
+                self.checks_blocked_by_org.append(f"{check}@{region}")
+                self.add(check, region, "-", ORG_BLOCKED_DETAIL, WARN, error=_err_text(exc))
+                log(f"  [{region}] {check}: 조직 정책(SCP)으로 차단 - {_err_text(exc)}")
+                return None
             reason = _reason(exc)
             self.checks_failed.append(f"{check}@{region}")
             self.add(check, region, "-", f"확인 불가({reason}) - 콘솔에서 직접 확인 필요", WARN, error=_err_text(exc))
@@ -468,6 +517,16 @@ class PreClose:
         log(f"  완료: {f['check']} {f['resource_id']} ({f['region']})")
         return True
 
+    def _blocked_by_org(self, check: str, exc: BaseException) -> bool:
+        """AccessDenied that comes from an organization SCP: the message names it, or it is a billing-side
+        check in a member account (where the reseller's SCPs deny billing/cost APIs)."""
+        if _err_code(exc) not in _ACCESS_DENIED:
+            return False
+        message = exc.response.get("Error", {}).get("Message", "") if isinstance(exc, ClientError) else ""
+        if "service control policy" in str(message).lower():
+            return True
+        return check in ORG_SENSITIVE_CHECKS and self.org_status() == ORG_MEMBER
+
     def regions_for(self, service: str) -> List[str]:
         """Skip regions where botocore knows the service is not offered (avoids slow endpoint retries)."""
         try:
@@ -502,6 +561,53 @@ class PreClose:
         for i, name in enumerate(selected, 1):
             log(f"[{i}/{len(selected)}] {name}")
             getattr(self, f"check_{name}")()
+
+    # -- AWS Organizations membership ------------------------------------------
+    def load_org(self) -> Dict[str, Any]:
+        """organizations:DescribeOrganization works from member accounts too. NotInUse = standalone;
+        AccessDenied (e.g. an SCP) or any other failure = unknown. Never raises."""
+        info: Dict[str, Any] = {"status": ORG_UNKNOWN, "org_id": None, "management_account_id": None,
+                                "management_email_domain": None, "feature_set": None, "error": None}
+        try:
+            org = self.c("organizations", HOME_REGION).describe_organization().get("Organization") or {}
+        except Exception as exc:  # noqa: BLE001
+            if _err_code(exc) == "AWSOrganizationsNotInUseException":
+                info["status"] = ORG_STANDALONE
+            else:
+                info["error"] = _err_text(exc)
+                log(f"  organizations:DescribeOrganization 실패 - 조직 소속 여부 알 수 없음 ({_err_text(exc)})")
+            self.org = info
+            return info
+        email = str(org.get("MasterAccountEmail") or "")
+        mgmt = org.get("MasterAccountId")
+        info.update(org_id=org.get("Id"), management_account_id=mgmt, feature_set=org.get("FeatureSet"),
+                    management_email_domain=email.rsplit("@", 1)[1] if "@" in email else None,
+                    status=ORG_MANAGEMENT if mgmt and mgmt == self.account else ORG_MEMBER)
+        self.org = info
+        return info
+
+    def org_status(self) -> str:
+        return (self.org or self.load_org())["status"]
+
+    def check_organization(self) -> None:
+        info = self.org or self.load_org()
+        status = info["status"]
+        domain = f" ({info['management_email_domain']})" if info.get("management_email_domain") else ""
+        if status == ORG_MEMBER:
+            rid = info.get("org_id") or "?"
+            detail = (f"member of org {rid}, management account {info.get('management_account_id') or '?'}{domain} - "
+                      "조직 멤버 계정: SCP와 청구는 관리 계정(리셀러)이 관리. 해지·청구 안내는 아래 reminder 참고")
+        elif status == ORG_MANAGEMENT:
+            rid = info.get("org_id") or "?"
+            detail = (f"management account of org {rid}{domain} - 이 계정이 조직의 관리 계정임. "
+                      "관리 계정은 멤버 계정을 모두 정리/제거한 뒤에만 해지 가능 - 교육 계정이 맞는지 확인")
+        elif status == ORG_STANDALONE:
+            rid = ORG_STANDALONE
+            detail = "standalone - AWS Organizations에 속하지 않은 독립 계정"
+        else:
+            rid = ORG_UNKNOWN
+            detail = f"unknown - 조직 소속 여부 확인 불가({info.get('error') or '?'})"
+        self.add("organization", GLOBAL, rid, detail, INFO)
 
     # -- account alias (loaded first: it is also the wrong-account guard) --
     def load_aliases(self) -> List[str]:
@@ -985,8 +1091,16 @@ class PreClose:
                      "루트 사용자에게 액세스 키가 있음 - 유출되면 무제한 과금/해킹 위험. IAM 사용자/역할로는 지울 수 없음: "
                      "루트로 로그인 > 보안 자격 증명 > 액세스 키 삭제", WARN)
 
+    def reminders(self) -> Tuple[Tuple[str, str], ...]:
+        status = self.org_status()
+        if status == ORG_MEMBER:
+            return MEMBER_REMINDERS
+        if status == ORG_UNKNOWN:
+            return UNKNOWN_ORG_REMINDERS
+        return REMINDERS  # standalone (or this is the management account itself)
+
     def check_reminders(self) -> None:
-        for rid, text in REMINDERS:
+        for rid, text in self.reminders():
             self.add("closure_reminder", GLOBAL, rid, text, INFO)
 
 
@@ -1017,6 +1131,7 @@ def _base_result(account: Optional[str], args: argparse.Namespace, regions: List
         "options": {"all_regions": bool(getattr(args, "all_regions", False)),
                     "delete_alias": bool(getattr(args, "delete_alias", False)),
                     "purge_recycle_bin": bool(getattr(args, "purge_recycle_bin", False))},
+        "organization": None,
         "summary": {},
         "findings": [],
         "error": None,
@@ -1044,7 +1159,9 @@ def build_result(pc: PreClose, args: argparse.Namespace, error: Optional[str] = 
         "info": sum(1 for f in findings if f["severity"] == INFO),
         "actions": {a: sum(1 for f in findings if f["action"] == a) for a in ACTIONS},
         "checks_failed": list(pc.checks_failed),
+        "checks_blocked_by_org": list(pc.checks_blocked_by_org),
     }
+    result["organization"] = pc.org
     result["findings"] = findings
     result["error"] = error
     return result, code
@@ -1110,11 +1227,17 @@ def render_summary(result: Dict[str, Any]) -> str:
     elif summary.get("blockers_remaining"):
         lines.append(f"판정: 해지 보류 - BLOCKER {summary['blockers_remaining']}건 남음"
                      + ("" if result.get("applied") else " (--apply로 고칠 수 있는 항목은 '예정' 표시)"))
+    elif (result.get("organization") or {}).get("status") == ORG_MEMBER:
+        lines.append("판정: BLOCKER 없음 - 수동 체크리스트를 마친 뒤 루트 콘솔에서 해지"
+                     "(SCP로 막히면 관리 계정(리셀러)에 해지 요청)")
     else:
         lines.append("판정: BLOCKER 없음 - 아래 수동 체크리스트를 마친 뒤 루트 콘솔에서 해지")
     if summary.get("checks_failed"):
         lines.append(f"주의: 확인하지 못한 점검 {len(summary['checks_failed'])}건 - "
                      f"{', '.join(summary['checks_failed'])} (콘솔에서 직접 확인)")
+    if summary.get("checks_blocked_by_org"):
+        lines.append(f"주의: 조직 정책(SCP)으로 막힌 점검 {len(summary['checks_blocked_by_org'])}건 - "
+                     f"{', '.join(summary['checks_blocked_by_org'])} (리셀러에게 확인)")
     return "\n".join(lines)
 
 
@@ -1167,12 +1290,21 @@ CloudShell이 Python 3.9이면 boto3 1.42.x까지만 설치된다. 이 버전에
 
 ## 수동 해지 체크리스트 (루트 사용자)
 1. `preclose_check.py --apply --delete-alias`의 결과가 exit 0인지 확인한다(남은 BLOCKER 0, "확인 불가" 경고가 없거나 콘솔에서 직접 확인함).
-2. 고칠 수 없는 BLOCKER(RI·Savings Plans·약정 PT·Shield)가 있었다면 AWS Support 케이스 번호를 기록한다.
+   SCP로 막힌 점검(`checks_blocked_by_org`)은 리셀러에게 확인을 요청한다.
+2. 고칠 수 없는 BLOCKER(RI·Savings Plans·약정 PT·Shield)가 있었다면 AWS Support 케이스 번호를 기록한다(멤버 계정이면 리셀러와 공유).
 3. 루트 이메일을 다시 쓸 계획이면 **해지 전에** 루트 이메일을 다른 주소(예: `ops+closed-<계정ID>@회사도메인`)로 바꾼다. 해지 후에는 바꿀 수 없다.
 4. 계정 별칭이 삭제됐는지 확인한다(`aws iam list-account-aliases`가 빈 목록). 별칭으로 로그인할 수 없게 되므로 계정 ID로 로그인한다.
 5. 루트 액세스 키가 있으면 삭제하고, 유료 Support 플랜이면 Basic으로 바꾼다.
 6. 루트로 콘솔 로그인 → 오른쪽 위 계정 메뉴 → **Account** → 맨 아래 **Close account**.
-7. 다음 달 초에 해지 전 사용분의 최종 청구서가 온다(정상). D+2 비용 확인은 `verify/` 모듈을 사용한다.
+   멤버 계정은 관리 계정(리셀러)이 Organizations `CloseAccount`로 해지할 수도 있다. 조직 SCP가 `account:CloseAccount`를 막아 루트로도 해지되지 않으면 리셀러에 해지를 요청한다.
+7. 해지 전 사용분은 다음 달 청구에 포함된다(정상). 멤버 계정은 관리 계정(리셀러)의 청구서로 가고, 해지 후 90일 동안 SUSPENDED 상태로 조직에 남는다.
+   청구·환불 문의는 리셀러를 통한다. 남은 리소스 확인은 `verify/` 모듈(inventory 모드)을 사용한다.
+
+근거: [Close an AWS account](https://docs.aws.amazon.com/accounts/latest/reference/manage-acct-closing.html),
+[Closing a member account](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_accounts_close.html),
+[CloseAccount API](https://docs.aws.amazon.com/organizations/latest/APIReference/API_CloseAccount.html),
+[Default security controls (SCP가 account:CloseAccount 거부)](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_security_default_controls.html),
+[Consolidated billing (관리 계정이 멤버 요금 지불)](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/consolidated-billing.html).
 
 ## 허브 오케스트레이터 연동 (CLI/JSON 계약)
 ```
@@ -1180,7 +1312,7 @@ python3 preclose/preclose_check.py --role-arn <arn> --external-id <id> [--region
     [--apply [--delete-alias] [--purge-recycle-bin]] --json-out <file>
 ```
 - exit: `0` 남은 BLOCKER 없음 · `1` BLOCKER 남음 · `2` 오류(자격 증명 실패, `prod` 별칭 + `--apply` 등)
-- JSON 최상위 키: `module`("preclose"), `account_id`, `generated_at`, `applied`, `status`(`OK`|`ISSUES`|`ERROR`), `ready_to_close`(exit 0이고 "확인 불가" 점검도 없을 때 true), `regions`, `options`, `summary`{`blockers_remaining`, `blockers_resolved`, `warn`, `info`, `actions`{none,planned,done,failed}, `checks_failed`[]}, `findings`[], `error`
+- JSON 최상위 키: `module`("preclose"), `account_id`, `generated_at`, `applied`, `status`(`OK`|`ISSUES`|`ERROR`), `ready_to_close`(exit 0이고 "확인 불가" 점검도 없을 때 true. SCP로 막힌 점검은 제외), `regions`, `options`, `organization`{`status`: standalone|member|management|unknown, `org_id`, `management_account_id`, `management_email_domain`, `feature_set`, `error`} (조직 점검을 안 돌렸으면 null), `summary`{`blockers_remaining`, `blockers_resolved`, `warn`, `info`, `actions`{none,planned,done,failed}, `checks_failed`[], `checks_blocked_by_org`[]}, `findings`[], `error`
 - finding: `{check, region, resource_id, detail, severity: BLOCKER|WARN|INFO, fixable, action: none|planned|done|failed, error}`
 - BLOCKER는 `action == "done"`일 때만 해결된 것으로 본다.
 
@@ -1190,3 +1322,4 @@ cd edu-cleanup && python3 -m pytest preclose/tests -q
 ```
 moto(cloudtrail 트레일, iam, route53domains, ec2 리전)와, moto에 없는 서비스(marketplace-agreement, rbin, savingsplans, bedrock PT, shield, EC2 휴지통, 예약 노드)는 botocore Stubber로 테스트한다.
 dry-run에서 변경 API 호출이 0인지, 멀티 리전 트레일 중복 제거, 잠긴 규칙을 지우지 않는지, 한 점검의 AccessDenied가 전체 실행을 멈추지 않는지, exit 코드를 검증한다.
+`test_preclose_org.py`는 독립/멤버/알 수 없음에 따른 해지 안내와 SCP로 막힌 청구 점검(WARN, BLOCKER 아님)을 검증한다. `test_preclose_readme_sync.py`는 위 CloudShell 블록 안의 코드가 실제 파일과 같은지 검사한다.

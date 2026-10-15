@@ -93,6 +93,24 @@ def denied(st: Stubber, method: str, code: str = "AccessDeniedException") -> Non
 
 
 # ------------------------------------------------------------------ scenario builders
+MGMT_ACCOUNT, ORG_ID = "999988887777", "o-abcde12345"
+
+
+def queue_org(h: Harness, status: str = "standalone") -> None:
+    """Queue organizations:DescribeOrganization for standalone / member / unknown (AccessDenied)."""
+    st = h.stub("organizations", US)
+    if status == "standalone":
+        st.add_client_error("describe_organization", service_error_code="AWSOrganizationsNotInUseException",
+                            service_message="Your account is not a member of an organization.", http_status_code=400)
+    elif status == "member":
+        st.add_response("describe_organization", {"Organization": {
+            "Id": ORG_ID, "Arn": f"arn:aws:organizations::{MGMT_ACCOUNT}:organization/{ORG_ID}", "FeatureSet": "ALL",
+            "MasterAccountId": MGMT_ACCOUNT, "MasterAccountEmail": "aws-billing@reseller.example",
+            "MasterAccountArn": f"arn:aws:organizations::{MGMT_ACCOUNT}:account/{ORG_ID}/{MGMT_ACCOUNT}"}}, {})
+    else:
+        denied(st, "describe_organization")
+
+
 def pt_summary(name: str, commitment: Optional[str]) -> Dict[str, Any]:
     s = {"provisionedModelName": name,
          "provisionedModelArn": f"arn:aws:bedrock:{REGION}:{ACCOUNT}:provisioned-model/{name}",
@@ -105,11 +123,12 @@ def pt_summary(name: str, commitment: Optional[str]) -> Dict[str, Any]:
 
 
 def queue_clean(h: Harness, *, alias: str = "edu-2026-10-07", delete_alias_call: bool = False,
-                skip: Iterable[str] = ()) -> None:
+                skip: Iterable[str] = (), org: str = "standalone") -> None:
     """Queue responses for an account where nothing is left (one region). `skip` = services the test queues itself."""
     skip = set(skip)
     iam = h.stub("iam", US)
     iam.add_response("list_account_aliases", {"AccountAliases": [alias] if alias else [], "IsTruncated": False})
+    queue_org(h, org)
     if "marketplace-agreement" not in skip:
         h.stub("marketplace-agreement", US).add_response(
             "search_agreements", {"agreementViewSummaries": []},
@@ -133,8 +152,9 @@ def queue_clean(h: Harness, *, alias: str = "edu-2026-10-07", delete_alias_call:
     h.stub("rds", REGION).add_response("describe_reserved_db_instances", {"ReservedDBInstances": []}, {})
     h.stub("elasticache", REGION).add_response("describe_reserved_cache_nodes", {"ReservedCacheNodes": []}, {})
     h.stub("redshift", REGION).add_response("describe_reserved_nodes", {"ReservedNodes": []}, {})
-    h.stub("savingsplans", US).add_response("describe_savings_plans", {"savingsPlans": []},
-                                            {"states": ["active", "queued", "payment-pending"]})
+    if "savingsplans" not in skip:
+        h.stub("savingsplans", US).add_response("describe_savings_plans", {"savingsPlans": []},
+                                                {"states": ["active", "queued", "payment-pending"]})
     h.stub("bedrock", REGION).add_response("list_provisioned_model_throughputs", {"provisionedModelSummaries": []}, {})
     h.stub("shield", US).add_response("get_subscription_state", {"SubscriptionState": "INACTIVE"}, {})
     h.stub("route53domains", US).add_response("list_domains", {"Domains": []}, {})
@@ -154,6 +174,7 @@ def queue_dirty(h: Harness, *, apply: bool) -> None:
     """Queue responses for an account where every check has something to report (one region)."""
     iam = h.stub("iam", US)
     iam.add_response("list_account_aliases", {"AccountAliases": ["edu-2026-10-07"], "IsTruncated": False})
+    queue_org(h, "standalone")
 
     mp = h.stub("marketplace-agreement", US)
     mp.add_response("search_agreements", {"agreementViewSummaries": [
