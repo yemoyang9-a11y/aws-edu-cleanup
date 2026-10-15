@@ -408,3 +408,22 @@ def test_every_check_uses_real_botocore_names(rtype, service, fn):
 def test_inventory_covers_at_least_forty_types():
     names = [c[0] for c in vc.REGIONAL_CHECKS + vc.GLOBAL_CHECKS]
     assert len(names) == len(set(names)) and len(names) + 1 >= 40  # + s3_buckets
+
+
+def test_bedrock_region_gating_is_not_applicable():
+    """Live 2026-10-15: bedrock imported/custom model listings fail only in regions without the feature."""
+    from botocore.exceptions import ClientError
+
+    def ce(code, msg="", status=400):
+        return ClientError({"Error": {"Code": code, "Message": msg},
+                            "ResponseMetadata": {"HTTPStatusCode": status}}, "List")
+
+    assert vc.classify_check_error(ce("ValidationException", "Unknown operation"), "bedrock_custom_models")[0] == vc.KIND_NA
+    assert vc.classify_check_error(ce("AccessDeniedException", "", 403), "bedrock_imported_models")[0] == vc.KIND_NA
+    assert vc.classify_check_error(
+        ce("AccessDeniedException", "Your account is not authorized to invoke this API operation."), "x")[0] == vc.KIND_NA
+    # an explicit SCP deny on a Bedrock check is still "blocked by policy"
+    assert vc.classify_check_error(
+        ce("AccessDeniedException", "with an explicit deny in a service control policy"), "bedrock_imported_models")[0] == vc.KIND_BLOCKED
+    # non-gated checks keep the old behaviour
+    assert vc.classify_check_error(ce("AccessDeniedException", "", 403), "ec2_instances")[0] == vc.KIND_BLOCKED

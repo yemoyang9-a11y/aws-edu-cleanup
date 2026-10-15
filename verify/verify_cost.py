@@ -844,7 +844,14 @@ NA_EXCEPTIONS = {"EndpointConnectionError", "UnknownEndpointError", "EndpointRes
 NA_MESSAGES = ("not authorized for region", "not authorized to use this region", "not supported in this region",
                "not supported in the region", "not supported in region", "not available in this region",
                "not available in the region", "not available in region", "region is not enabled",
-               "region not enabled", "needs a subscription")
+               "region not enabled", "needs a subscription",
+               # Bedrock features missing in a region answer ValidationException "Unknown operation" or
+               # AccessDenied "...not authorized to invoke this API operation" (seen live, 2026-10-15).
+               "unknown operation", "not authorized to invoke this api operation")
+# Checks whose features only exist in some regions: a plain AccessDenied there (no SCP wording) is region
+# gating, not a policy. Seen live: bedrock imported/custom models answered AccessDenied in exactly the
+# regions without Custom Model Import.
+REGION_GATED_CHECK_PREFIXES = ("bedrock_",)
 # Denied by a policy (with AdministratorAccess this is an SCP or permission boundary) -> counted separately.
 BLOCKED_CODES = {"AccessDenied", "AccessDeniedException", "UnauthorizedOperation", "UnauthorizedException",
                  "AuthorizationError", "AuthorizationErrorException", "Forbidden", "ForbiddenException",
@@ -863,7 +870,7 @@ def _err(e: Exception) -> Tuple[str, str]:
     return type(e).__name__, str(e)
 
 
-def classify_check_error(e: Exception) -> Tuple[str, str, str]:
+def classify_check_error(e: Exception, rtype: str = "") -> Tuple[str, str, str]:
     """-> (kind, code, message). kind: not_applicable | blocked_by_policy | error."""
     code, msg = _err(e)
     low = str(msg).lower()
@@ -877,6 +884,8 @@ def classify_check_error(e: Exception) -> Tuple[str, str, str]:
         return KIND_NA, code, msg
     status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode") if isinstance(e, ClientError) else None
     if code in BLOCKED_CODES or "accessdenied" in code.lower() or status == 403:
+        if rtype.startswith(REGION_GATED_CHECK_PREFIXES):
+            return KIND_NA, code, msg
         return KIND_BLOCKED, code, msg
     return KIND_ERROR, code, msg
 
@@ -963,7 +972,7 @@ class Inventory:
                                     "code": code, "message": str(message)[:300]})
 
     def fail_exc(self, region: str, rtype: str, e: Exception) -> str:
-        kind, code, msg = classify_check_error(e)
+        kind, code, msg = classify_check_error(e, rtype)
         self.fail(region, rtype, code, msg, kind)
         return kind
 
