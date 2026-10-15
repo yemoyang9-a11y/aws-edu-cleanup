@@ -4,11 +4,15 @@ Every module in this repo MUST follow these rules so the hub orchestrator can ca
 and so they all work standalone in AWS CloudShell.
 
 ## Context
-- A company runs AWS hands-on training. Each student gets a **standalone AWS account**
-  (no AWS Organizations, no management account). The company holds root; students get IAM users.
+- A company runs AWS hands-on training. Each student gets one AWS account. The accounts are **member accounts
+  of an AWS reseller's Organization** that the company does not control: no custom SCPs, and the reseller's SCPs
+  block all cost/billing visibility (Cost Explorer denied, even for root); billing goes through the reseller.
+  The company holds root + IAM credentials; students get IAM users. So modules rely on IAM-level controls inside
+  the account (killswitch) and resource-based verification (verify inventory mode), never on SCPs or cost data.
 - Courses use **ap-northeast-2 (Seoul)** and **us-east-1 (N. Virginia)**. IAM etc. = `global`.
-- After a cohort, accounts are cleaned with **aws-nuke (ekristen v3.68.x)** and then **closed** (closure is
-  root-console only — no API for standalone accounts).
+- After a cohort, accounts are cleaned with **aws-nuke (ekristen v3.68.x)** and then **closed** — by the member's
+  root in the console (unless an SCP denies `account:CloseAccount`) or by the reseller's management account
+  (`CloseAccount`). Closed members stay in the org for the 90-day post-closure period. `preclose` detects membership.
 - Operators like **one copy-paste block for CloudShell**. Every module's README must include one.
 - Per-course IAM guardrail policies are **out of scope** (they differ per course).
 
@@ -22,7 +26,7 @@ edu-cleanup/
   cfn_predelete/        4) delete CloudFormation stacks before nuke
   preclose/             5) pre-closure checks (things that bill after closure)
   hub/                  6) hub/cleanup account: bootstrap template + orchestrator
-  verify/               7) D+2 cost verification
+  verify/               7) post-cleanup verification (inventory mode; cost mode where billing data is visible)
 ```
 
 ## Fixed names

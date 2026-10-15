@@ -1,6 +1,14 @@
 # edu-cleanup — AWS 교육 계정 정리 도구
 
-교육생마다 독립 AWS 계정(Organizations 없음)을 주는 교육에서, 교육이 끝난 계정을 **빠르고, 빠짐없이, 해지 후 요금 없이** 정리하기 위한 도구 모음입니다. aws-nuke를 대체하지 않고 앞뒤를 감쌉니다.
+교육생마다 AWS 계정을 하나씩 주는 교육에서, 교육이 끝난 계정을 **빠르고, 빠짐없이, 해지 후 요금 없이** 정리하기 위한 도구 모음입니다. aws-nuke를 대체하지 않고 앞뒤를 감쌉니다.
+
+## 전제: 리셀러 조직의 멤버 계정
+
+- 교육 계정은 독립 계정이 아니라 **AWS 리셀러 조직(AWS Organizations)의 멤버 계정**입니다. 회사는 리셀러에게서 루트·IAM 자격 증명을 받아 관리하지만, 조직(관리 계정)은 회사가 통제하지 않습니다.
+- 리셀러의 SCP가 비용·청구 화면을 루트까지 막고(Cost Explorer 거부), 회사용 SCP를 따로 걸어 주지도 않습니다. 청구서는 리셀러를 통해 옵니다.
+- 그래서 이 도구는 SCP나 비용 데이터에 기대지 않고 **계정 안의 IAM 수준 통제**(`killswitch`)와 **리소스 기반 검증**(`verify` inventory 모드)으로 동작합니다.
+- `hub`도 똑같이 동작합니다. 각 멤버 계정 안에 설치한 `EduCleanupRole`을 AssumeRole합니다(조직 기능은 쓰지 않음).
+- 해지는 루트 콘솔(*Account → Close account*) 또는 관리 계정(리셀러)이 할 수 있고, 리셀러 SCP가 막으면 리셀러에 요청합니다. 해지 후 90일 동안 조직에 남고, 요금·환불 문의(예: Bedrock 과다 사용 면제)는 리셀러를 거칩니다. `preclose`가 조직 소속을 확인해 이 안내를 보여 줍니다.
 
 ## 폴더별 역할
 
@@ -9,8 +17,8 @@
 | `nuke/` | aws-nuke 설정 생성 + 리전 병렬 실행기, CloudShell 원샷 블록 | DynamoDB 삭제 실패, 에러 로그 폭주, 끝없는 대기, 느린 순차 실행 |
 | `cfn_predelete/` | nuke 전에 CloudFormation 스택을 병렬로 먼저 삭제 (Express → 실패 시 강제 삭제) | 스택 하나가 nuke 전체를 최대 60분씩 멈추는 문제, 역할이 먼저 지워져 스택 삭제 실패 |
 | `killswitch/` | Bedrock 토큰 사용량이 임계치를 넘으면 몇 분 안에 교육생 Deny + 키 비활성화 | Budgets(8~12시간 지연)로는 못 막는 Bedrock 과금·해킹 |
-| `preclose/` | 해지 직전 점검: Marketplace 구독, CloudTrail, 휴지통 규칙, 약정 상품, 도메인 자동 갱신 | 해지 후에도 나오는 요금 |
-| `verify/` | 정리 2일 뒤 Cost Explorer로 서비스별 비용이 0인지 판정 (CLEAN / RESIDUAL / PENDING) | nuke가 "성공"인데 리소스가 남는 조용한 누락 |
+| `preclose/` | 해지 직전 점검: 조직 소속, Marketplace 구독, CloudTrail, 휴지통 규칙, 약정 상품, 도메인 자동 갱신 | 해지 후에도 나오는 요금 |
+| `verify/` | 정리 직후 남은 과금 리소스를 리전별로 조회해 판정 (`--mode inventory`; 비용 데이터를 볼 수 있는 계정이면 `cost`/`auto`) | nuke가 "성공"인데 리소스가 남는 조용한 누락 |
 | `hub/` | 정리 계정에서 여러 계정을 한 번에 돌리는 오케스트레이터 + 계정 생성 시 심는 부트스트랩 링크 | 계정마다 루트 로그인하는 수작업 |
 
 자세한 사용법은 각 폴더의 README에 있고, 모든 README에 CloudShell에 그대로 붙여 넣는 블록이 들어 있습니다.
@@ -22,11 +30,22 @@
           killswitch: 계정·리전마다 차단 스위치 배포 (hub의 killswitch 명령으로 일괄)
 교육 후   hub plan   → 결과 확인 (cfn_predelete → nuke → preclose, 모두 dry-run)
           hub clean  → 실제 삭제
-D+2       hub verify → CLEAN 확인
-해지 전   preclose --apply 로 남은 구독·트레일 정리 → 루트 콘솔에서 해지
+          hub verify → 바로 이어서 남은 리소스 확인 (inventory 모드, CLEAN 확인)
+해지 전   preclose --apply 로 남은 구독·트레일 정리 → 루트 콘솔에서 해지 (막히면 리셀러에 요청)
 ```
 
-계정 한두 개라면 hub 없이 CloudShell에서 `cfn_predelete` → `nuke/cloudshell-oneshot.sh` → `preclose` → (2일 뒤) `verify` 순서로 각 README의 블록을 붙여 넣으면 됩니다.
+계정 한두 개라면 hub 없이 CloudShell에서 `cfn_predelete` → `nuke/cloudshell-oneshot.sh` → `preclose` → `verify` 순서로 각 README의 블록을 붙여 넣으면 됩니다.
+verify는 기다릴 필요 없이 정리 직후 실행합니다: `python3 verify/verify_cost.py --mode inventory --all-regions`
+
+## 실행 팁
+
+- 셸에서 변수 이름을 `GROUPS`로 짓지 마세요. bash 내장 변수라 값이 덮어써지지 않습니다. `RGROUPS`처럼 다른 이름을 씁니다.
+- 모든 리전을 nuke할 때는(`nuke/run_nuke.sh`) 리전을 4개씩 묶어 `--no-global`로 실행하고, IAM 같은 전역 리소스는 마지막에 `--regions global`로 한 번만 실행합니다.
+  ```bash
+  RGROUPS=("ap-northeast-2,us-east-1,us-east-2,us-west-2" "ap-northeast-1,ap-southeast-1,eu-west-1,eu-central-1")
+  for g in "${RGROUPS[@]}"; do bash nuke/run_nuke.sh --regions "$g" --no-global; done   # 확인 후 --apply
+  bash nuke/run_nuke.sh --regions global
+  ```
 
 ## 공통 규칙
 
@@ -40,7 +59,7 @@ D+2       hub verify → CLEAN 확인
 - 단위·통합 테스트 360여 개 (moto 모의 AWS, 실제 aws-nuke v3.68.3 바이너리 포함), cfn-lint, shellcheck 통과.
 - 모의 AWS 위에서 hub → 다른 계정 역할 전환 → 스택 병렬 삭제 → nuke까지 end-to-end로 확인했습니다.
 - **실제 AWS 계정에서는 아직 돌려보지 않았습니다.** 첫 적용은 테스트용 계정 하나에서 dry-run부터 해 보세요.
-- 계정 해지는 AWS가 API를 제공하지 않아 루트 콘솔에서 직접 해야 합니다.
+- 계정 해지는 회사 쪽에서는 루트 콘솔로 합니다. 해지 API(`CloseAccount`)는 조직 관리 계정(리셀러)만 쓸 수 있습니다.
 
 ## 라이선스
 

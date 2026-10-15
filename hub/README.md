@@ -1,16 +1,17 @@
 # hub — 정리 계정(허브)과 다계정 오케스트레이터
 
-교육이 끝난 학생 계정 수십 개를 한 곳에서 dry-run → 검토 → 정리 → D+2 검증까지 돌리는 모듈입니다.
-AWS Organizations 없이 standalone 계정만 쓰는 환경을 전제로 합니다.
+교육이 끝난 학생 계정 수십 개를 한 곳에서 dry-run → 검토 → 정리 → 검증까지 돌리는 모듈입니다.
+학생 계정은 리셀러 조직(AWS Organizations)의 멤버 계정이지만, 조직은 회사가 통제하지 않으므로 조직 기능(StackSets, SCP, 비용 데이터)을 쓰지 않습니다.
+허브는 각 멤버 계정 **안에** 설치한 `EduCleanupRole`을 AssumeRole해서 동작합니다.
 
 ## 개념: 정리 계정 = 관리실 마스터키
 
-- 회사 소유 standalone 계정 하나를 **정리 계정(허브)** 으로 정합니다. 오케스트레이터는 여기서만 돕니다.
+- 회사가 관리하는 계정 하나를 **정리 계정(허브)** 으로 정합니다. 오케스트레이터는 여기서만 돕니다.
 - 각 학생 계정에는 처음 한 번 **자물쇠**를 달아 둡니다. 이 자물쇠가 `EduCleanupRole`(AdministratorAccess)입니다.
   이 역할은 허브의 지정된 역할/사용자 하나가 정해진 `ExternalId`를 낼 때만 열립니다.
 - 허브는 이 마스터키로 각 학생 계정에 들어가 `cfn_predelete → nuke → preclose`를 차례로 실행합니다.
   여러 계정은 동시에 처리합니다.
-- Organizations가 없으면 바깥에서 자물쇠를 달 방법이 없습니다. 그래서 **계정마다 루트로 한 번** quick-create 링크를 열어야 합니다.
+- 조직 관리 계정은 리셀러 것이라 바깥에서 자물쇠를 달 방법이 없습니다. 그래서 **계정마다 루트로 한 번** quick-create 링크를 열어야 합니다.
   계정당 1분 정도 걸리고, 학생 IAM 사용자를 만들려고 루트로 로그인하는 그 세션에서 같이 하면 됩니다.
 - **registry.json = 허용 목록**입니다. 여기에 없는 계정은 절대 건드리지 않습니다.
   계정마다 실행 전에 세 가지를 확인하고(preflight), 하나라도 다르면 `FAILED_PREFLIGHT`로 건너뜁니다.
@@ -23,7 +24,7 @@ AWS Organizations 없이 standalone 계정만 쓰는 환경을 전제로 합니�
    registry.json (허용 목록)                                          ├ cfn_predelete/predelete_stacks.py
    state/<기수>/<계정>/ (상태·로그)                                    ├ nuke/run_nuke.sh
                                                                      ├ preclose/preclose_check.py
-                                                                     └ (D+2) verify/verify_cost.py
+                                                                     └ verify/verify_cost.py (정리 직후)
 ```
 
 ## 파일
@@ -57,9 +58,8 @@ AWS Organizations 없이 standalone 계정만 쓰는 환경을 전제로 합니�
    aws s3 cp hub/bootstrap.yaml s3://<버킷>/edu/bootstrap.yaml
    # 템플릿 URL: https://<버킷>.s3.<리전>.amazonaws.com/edu/bootstrap.yaml
    ```
-4. **Cost Explorer는 학생 계정마다 콘솔에서 한 번 켜야 합니다.** API로는 켤 수 없습니다.
-   부트스트랩을 하는 루트 세션에서 *Billing and Cost Management → Cost Explorer*를 한 번 열어 두세요.
-   D+2 `verify`가 Cost Explorer API를 쓰고, 데이터는 켠 뒤 약 24시간 후부터 쌓입니다.
+4. **Cost Explorer는 준비할 필요가 없습니다.** 리셀러 SCP가 멤버 계정의 비용·청구 API를 루트까지 막기 때문입니다.
+   `verify`는 남은 과금 리소스를 직접 조회하는 inventory 모드로 판정합니다(기본 `auto`는 비용 데이터가 막히면 inventory로 대체).
 
 ## 2. 기수마다 하는 일
 
@@ -114,15 +114,17 @@ python3 hub/orchestrate.py clean --registry registry-2026-10.json
   예: `clean --steps preclose --fix-preclose`. 이렇게 일부 단계만 다시 돌리면 나머지 단계의 마지막 결과는 그대로 유지됩니다.
 - 특정 계정만: `--accounts 111111111111,222222222222`
 
-### ⑥ D+2 verify
+### ⑥ verify (clean 직후)
 ```bash
 python3 hub/orchestrate.py verify --registry registry-2026-10.json   # --cleanup-date 생략 시 마지막 clean 날짜
 ```
-결과는 `VERIFIED_CLEAN`(0), `RESIDUAL`(1), `PENDING`(3, 아직 판단하기 이른 시점)입니다. `PENDING`이면 하루 뒤에 다시 실행합니다.
+기다리지 않고 clean 직후 실행합니다. 리소스 기반(inventory) 판정이라 비용 데이터가 쌓일 때까지 기다릴 필요가 없습니다.
+계정 하나를 직접 확인할 때는 `python3 verify/verify_cost.py --mode inventory --all-regions --role-arn … --external-id …`.
+결과는 `VERIFIED_CLEAN`(0), `RESIDUAL`(1), `PENDING`(3, cost 모드에서 아직 판단하기 이른 시점)입니다.
 
 ### ⑦ 해지 전 수정 → 루트 콘솔에서 해지
 - `preclose` 보고서의 차단 요소를 처리합니다(`--fix-preclose` 또는 수동). 차단 요소의 예: Marketplace 구독, RI/SP, Route 53 도메인, CloudTrail 트레일, 별칭.
-- **standalone 계정 해지는 API가 없고 루트 콘솔에서만 할 수 있습니다.** 계정마다 루트로 로그인해 *계정 → 계정 해지*를 진행합니다.
+- 회사 쪽 해지는 계정마다 루트로 로그인해 *계정 → 계정 해지*로 합니다. 해지 API(`CloseAccount`)는 조직 관리 계정(리셀러)만 쓸 수 있고, 리셀러 SCP가 루트의 해지를 막으면 리셀러에 요청합니다. `preclose` 보고서의 `organization`·`closure_reminder` 항목을 참고하세요.
 - 별칭이 이미 지워졌다면 `verify`는 별칭이 *없는* 상태만 허용합니다. 다른 별칭이 붙어 있으면 여전히 거부합니다.
 
 ### 상태 확인
@@ -168,7 +170,7 @@ python3 hub/orchestrate.py plan   --registry "$REG"
 python3 hub/orchestrate.py status --registry "$REG"
 # 로그 검토 후
 python3 hub/orchestrate.py clean  --registry "$REG"
-# D+2
+# clean 직후
 python3 hub/orchestrate.py verify --registry "$REG"
 ```
 
