@@ -92,6 +92,9 @@ echo "########## 확인 ##########"
 echo " 계정 번호 $ACCT 의 리소스를 삭제합니다. (영문/숫자 입력 상태인지 확인하세요)"
 OK_INPUT=""
 exec 3<"${EDU_CLEANUP_TTY:-/dev/tty}" || { echo " 입력을 받을 수 없어요(터미널 아님). 아무것도 지우지 않았어요."; exit 3; }
+# Drop anything already waiting on the terminal (e.g. leftover lines of a pasted block), so it can't
+# answer the prompt by accident. Only for a real terminal; tests feed a file through EDU_CLEANUP_TTY.
+if [ -z "${EDU_CLEANUP_TTY:-}" ]; then while read -r -t 0.3 -u 3 _junk; do :; done; fi
 for _ in 1 2 3; do
   read -r -u 3 -p " 삭제하려면 계정 번호 12자리를 입력 (그만두려면 그냥 Enter): " OK_INPUT || OK_INPUT=""
   OK_INPUT="${OK_INPUT//[^0-9]/}"
