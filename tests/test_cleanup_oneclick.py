@@ -142,6 +142,18 @@ def test_stage_timing_recorded_and_printed(repo):
     assert p.stdout.rstrip().splitlines()[-1].startswith(" 전체 로그")   # banner stays at the bottom
 
 
+def test_nuke_apply_leaves_stacks_to_cfn_predelete(repo):
+    # aws-nuke blocks a whole region in WaitUntilStackDeleteComplete when a stack is already DELETE_IN_PROGRESS
+    # (resources/cloudformation-stack.go). Stacks are handled by cfn_predelete every pass, so nuke --apply skips them.
+    p, calls, _ = run(repo, {"verify": ["RESIDUAL", "CLEAN"]}, ACCT + "\n")
+    assert p.returncode == 0, p.stdout + p.stderr
+    nuke = [c for c in calls.splitlines() if c.startswith("nuke ")]
+    applies = [c for c in nuke if "--apply" in c]
+    previews = [c for c in nuke if "--apply" not in c]
+    assert applies and all("--extra-excludes CloudFormationStack" in c for c in applies), applies
+    assert previews and not any("--extra-excludes" in c for c in previews), previews
+
+
 def test_stack_wait_option(repo):
     p, calls, _ = run(repo, {"verify": ["CLEAN"]}, ACCT + "\n", "--cfn-wait-min", "12")
     assert p.returncode == 0, p.stdout + p.stderr

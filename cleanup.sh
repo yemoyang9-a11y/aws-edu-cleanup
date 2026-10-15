@@ -60,14 +60,19 @@ fi
 
 nuke_all() {  # $1 = tag for result files, $2 = "" (preview) or --apply
   local tag="$1" mode="$2" i=0 G
+  local skip=()
+  # On --apply, CloudFormation stacks are left to cfn_predelete (run every pass): aws-nuke waits in
+  # WaitUntilStackDeleteComplete on a stack that is already DELETE_IN_PROGRESS, which freezes that whole
+  # region with no output (resources/cloudformation-stack.go). The preview still lists them.
+  [ "$mode" = --apply ] && skip=(--extra-excludes CloudFormationStack)
   for G in $RGROUPS; do
     i=$((i + 1)); echo "===== $G"
     # shellcheck disable=SC2086
-    bash nuke/run_nuke.sh --regions "$G" --no-global "${PROTECT[@]}" --json-out "$RUN/nuke-$tag-$i.json" $mode
+    bash nuke/run_nuke.sh --regions "$G" --no-global "${PROTECT[@]}" "${skip[@]}" --json-out "$RUN/nuke-$tag-$i.json" $mode
   done
   echo "===== global"
   # shellcheck disable=SC2086
-  bash nuke/run_nuke.sh --regions global "${PROTECT[@]}" --json-out "$RUN/nuke-$tag-z-global.json" $mode
+  bash nuke/run_nuke.sh --regions global "${PROTECT[@]}" "${skip[@]}" --json-out "$RUN/nuke-$tag-z-global.json" $mode
 }
 recreate_default_vpcs() {
   local R
