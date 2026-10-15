@@ -116,6 +116,27 @@ def test_retry_then_clean(repo):
     assert "삭제 시도 횟수: 2" in rep
 
 
+def _cfn_apply_calls(calls):
+    return [c for c in calls.splitlines() if c.startswith("cfn ") and "--apply" in c]
+
+
+def test_stack_wait_is_short_and_retried_each_pass(repo):
+    # A slow stack (VPC Lambda ENIs, 20-40 min on AWS's side) must not hold the whole run for 30 min:
+    # wait briefly, let nuke work meanwhile, and re-send stack deletes (FORCE for DELETE_FAILED) on later passes.
+    p, calls, _ = run(repo, {"verify": ["RESIDUAL", "CLEAN"]}, ACCT + "\n")
+    assert p.returncode == 0, p.stdout + p.stderr
+    cfn = _cfn_apply_calls(calls)
+    assert len(cfn) == 2, calls
+    assert all("--timeout-min 5" in c for c in cfn), cfn
+
+
+def test_stack_wait_option(repo):
+    p, calls, _ = run(repo, {"verify": ["CLEAN"]}, ACCT + "\n", "--cfn-wait-min", "12")
+    assert p.returncode == 0, p.stdout + p.stderr
+    cfn = _cfn_apply_calls(calls)
+    assert len(cfn) == 1 and "--timeout-min 12" in cfn[0], cfn
+
+
 def test_still_dirty_after_max_passes(repo):
     p, calls, rep = run(repo, {"verify": ["RESIDUAL"]}, ACCT + "\n", "--max-passes", "3")
     assert p.returncode == 2

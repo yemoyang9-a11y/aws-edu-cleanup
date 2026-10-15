@@ -25,7 +25,7 @@ cd ~ && (git -C aws-edu-cleanup pull -q 2>/dev/null || git clone -q https://gith
    - **✅ 정리 완료** → 끝. 창을 닫으면 됩니다.
    - **⚠️ / ❌** → 화면에 나온 보고서 파일(`~/cleanup-report-...txt`)을 담당자에게 보내 주세요. CloudShell 오른쪽 위 *작업 → 파일 다운로드*로 받을 수 있습니다.
 
-기존 IAM 사용자는 기본으로 **유지**합니다. 옵션: `--preview-only`(미리보기만), `--skip-preview`(미리보기 생략), `--delete-iam-users`(IAM 사용자도 삭제), `--max-passes N`, `--wait-min M`.
+기존 IAM 사용자는 기본으로 **유지**합니다. 옵션: `--preview-only`(미리보기만), `--skip-preview`(미리보기 생략), `--delete-iam-users`(IAM 사용자도 삭제), `--max-passes N`, `--wait-min M`, `--cfn-wait-min M`(CloudFormation 스택을 기다리는 시간, 기본 5분. 더 오래 걸리는 스택은 AWS가 계속 지우는 동안 다음 회차에서 다시 요청).
 
 ## 폴더별 역할
 

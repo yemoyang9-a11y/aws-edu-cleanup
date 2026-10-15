@@ -7,6 +7,8 @@
 #   bash cleanup.sh --preview-only      # list what would be deleted, change nothing
 #
 # Options: --max-passes N (default 3)  --wait-min M (default 5, wait between passes)
+#          --cfn-wait-min M (default 5, how long to wait for CloudFormation stacks before moving on;
+#          slow stacks keep deleting on AWS's side and are re-sent on every pass)
 # Output:  big banner at the end, full log  ~/cleanup-<account>-<time>.log,
 #          report for the person in charge  ~/cleanup-report-<account>-<time>.txt
 # Exit:    0 ✅ done | 1 ⚠️ cleaned, check before closing | 2 ❌ not clean / error | 3 cancelled
@@ -17,6 +19,7 @@ SKIP_PREVIEW=0
 PREVIEW_ONLY=0
 MAX_PASSES=3
 WAIT_MIN=5
+CFN_WAIT_MIN=5
 while [ $# -gt 0 ]; do
   case "$1" in
     --delete-iam-users) KEEP_IAM_USERS=0 ;;
@@ -25,7 +28,8 @@ while [ $# -gt 0 ]; do
     --preview-only) PREVIEW_ONLY=1 ;;
     --max-passes) MAX_PASSES="${2:?}"; shift ;;
     --wait-min) WAIT_MIN="${2:?}"; shift ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    --cfn-wait-min) CFN_WAIT_MIN="${2:?}"; shift ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "알 수 없는 옵션: $1"; exit 2 ;;
   esac
   shift
@@ -106,13 +110,17 @@ exec 3<&-
 [ "$OK_INPUT" = "$ACCT" ] || { echo " 세 번 틀려서 취소했어요. 아무것도 지우지 않았어요."; exit 3; }
 
 echo; echo "########## [2/3] 삭제 ##########"
-python3 cfn_predelete/predelete_stacks.py --regions "$REGIONS" --apply --json-out "$RUN/cfn.json"
 
 PASS=0
 LAST_TAG=""
 while :; do
   PASS=$((PASS + 1)); LAST_TAG="pass$PASS"
   echo; echo "---------- 삭제 ${PASS}회차 ----------"
+  # Stacks first, but only wait a few minutes: a stack held by VPC Lambda ENIs takes 20-40 min on AWS's side.
+  # It keeps deleting in the background while nuke works; the next pass re-sends it (FORCE if DELETE_FAILED).
+  python3 cfn_predelete/predelete_stacks.py --regions "$REGIONS" --apply --timeout-min "$CFN_WAIT_MIN" \
+    --json-out "$RUN/cfn-$LAST_TAG.json" \
+    || echo " 아직 지워지는 중인 스택이 있어요(TIMEOUT은 정상). AWS가 계속 지우는 동안 다음 단계로 넘어갑니다."
   nuke_all "$LAST_TAG" --apply
   recreate_default_vpcs
   echo; echo "########## [3/3] 남은 리소스 확인 (${PASS}회차) ##########"
