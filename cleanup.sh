@@ -43,6 +43,7 @@ LOG="$HOME/cleanup-$ACCT-$TS.log"
 REPORT="$HOME/cleanup-report-$ACCT-$TS.txt"
 RUN="$HOME/.edu-cleanup-runs/$ACCT-$TS"
 mkdir -p "$RUN"
+mark() { printf '%s\t%s\n' "$(date +%s)" "$1" >>"$RUN/timing.tsv"; }  # read by tools/timing.py
 exec > >(tee -a "$LOG") 2>&1
 
 REGIONS="$(aws account list-regions --region-opt-status-contains ENABLED ENABLED_BY_DEFAULT \
@@ -85,14 +86,18 @@ echo "################################################################"
 
 if [ "$SKIP_PREVIEW" = 0 ]; then
   echo; echo "########## [1/3] 미리보기 (아무것도 지우지 않음) ##########"
+  mark "미리보기: 해지 전 점검"
   python3 preclose/preclose_check.py --all-regions
+  mark "미리보기: 스택 조회"
   python3 cfn_predelete/predelete_stacks.py --regions "$REGIONS"
+  mark "미리보기: nuke 조회 (지우지 않음)"
   nuke_all preview ""
-  if [ "$PREVIEW_ONLY" = 1 ]; then echo; echo "미리보기만 했어요. 아무것도 지우지 않았어요."; exit 0; fi
+  if [ "$PREVIEW_ONLY" = 1 ]; then mark end; echo; echo "미리보기만 했어요. 아무것도 지우지 않았어요."; exit 0; fi
 fi
 
 echo
 echo "########## 확인 ##########"
+mark "계정 번호 입력 대기"
 echo " 계정 번호 $ACCT 의 리소스를 삭제합니다. (영문/숫자 입력 상태인지 확인하세요)"
 OK_INPUT=""
 exec 3<"${EDU_CLEANUP_TTY:-/dev/tty}" || { echo " 입력을 받을 수 없어요(터미널 아님). 아무것도 지우지 않았어요."; exit 3; }
@@ -118,19 +123,29 @@ while :; do
   echo; echo "---------- 삭제 ${PASS}회차 ----------"
   # Stacks first, but only wait a few minutes: a stack held by VPC Lambda ENIs takes 20-40 min on AWS's side.
   # It keeps deleting in the background while nuke works; the next pass re-sends it (FORCE if DELETE_FAILED).
+  mark "스택 삭제 (${PASS}회차)"
   python3 cfn_predelete/predelete_stacks.py --regions "$REGIONS" --apply --timeout-min "$CFN_WAIT_MIN" \
     --json-out "$RUN/cfn-$LAST_TAG.json" \
     || echo " 아직 지워지는 중인 스택이 있어요(TIMEOUT은 정상). AWS가 계속 지우는 동안 다음 단계로 넘어갑니다."
+  mark "nuke 삭제 (${PASS}회차)"
   nuke_all "$LAST_TAG" --apply
+  mark "기본 VPC 재생성 (${PASS}회차)"
   recreate_default_vpcs
   echo; echo "########## [3/3] 남은 리소스 확인 (${PASS}회차) ##########"
+  mark "남은 리소스 확인 (${PASS}회차)"
   if verify "$RUN/verify.json"; then break; fi
   if [ "$PASS" -ge "$MAX_PASSES" ]; then break; fi
   echo " 아직 남은 리소스가 있어요. 지우는 중일 수 있으니 ${WAIT_MIN}분 기다렸다가 다시 시도합니다..."
+  mark "회차 사이 대기 (${WAIT_MIN}분)"
   sleep $((WAIT_MIN * 60))
 done
 
+mark "해지 전 점검 (적용)"
 python3 preclose/preclose_check.py --all-regions --apply --json-out "$RUN/preclose.json"
+mark end
+
+echo; echo "########## 단계별 소요 시간 ##########"
+python3 tools/timing.py "$RUN" || true
 
 echo
 python3 tools/report.py --account "$ACCT" --verify "$RUN/verify.json" --preclose "$RUN/preclose.json" \

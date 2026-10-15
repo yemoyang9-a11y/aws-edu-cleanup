@@ -62,6 +62,7 @@ def repo(tmp_path):
     (r / "tools").mkdir(parents=True)
     shutil.copy(ROOT / "cleanup.sh", r / "cleanup.sh")
     shutil.copy(ROOT / "tools" / "report.py", r / "tools" / "report.py")
+    shutil.copy(ROOT / "tools" / "timing.py", r / "tools" / "timing.py")
     stub = tmp_path / "stub.py"
     stub.write_text(STUB)
     for rel, step, kind in (("nuke/run_nuke.sh", "nuke", "sh"), ("cfn_predelete/predelete_stacks.py", "cfn", "py"),
@@ -128,6 +129,17 @@ def test_stack_wait_is_short_and_retried_each_pass(repo):
     cfn = _cfn_apply_calls(calls)
     assert len(cfn) == 2, calls
     assert all("--timeout-min 5" in c for c in cfn), cfn
+
+
+def test_stage_timing_recorded_and_printed(repo):
+    p, _, _ = run(repo, {"verify": ["RESIDUAL", "CLEAN"]}, ACCT + "\n")
+    assert p.returncode == 0, p.stdout + p.stderr
+    marks = sorted((repo[2] / ".edu-cleanup-runs").glob(f"{ACCT}-*/timing.tsv"))[-1].read_text()
+    for label in ("계정 번호 입력 대기", "스택 삭제 (1회차)", "nuke 삭제 (2회차)", "회차 사이 대기", "해지 전 점검 (적용)"):
+        assert label in marks, marks
+    assert marks.rstrip().endswith("\tend")
+    assert "단계별 소요 시간" in p.stdout and "총 소요" in p.stdout and "단계 기록 기준" in p.stdout
+    assert p.stdout.rstrip().splitlines()[-1].startswith(" 전체 로그")   # banner stays at the bottom
 
 
 def test_stack_wait_option(repo):
