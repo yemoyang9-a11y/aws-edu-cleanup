@@ -12,7 +12,7 @@
 #   3. makes sure the account has an alias (aws-nuke refuses accounts without one); creates edu-<id> on --apply
 #   4. one config per region (make_config.py); all regions IN PARALLEL, then `global` LAST
 #   5. --log-format json -> per-region summary with jq (would-remove/removed/failed/remaining by type,
-#      "listing failed" by type) + JSON result (CONTRACTS.md)
+#      "listing failed" by type, classified with listing_errors.json) + JSON result (CONTRACTS.md)
 # Exit: 0 nothing left (apply) / dry-run OK, 1 failed or remaining items (or an apply-run was cut short), 2 error.
 set -euo pipefail
 
@@ -41,8 +41,8 @@ INSTALL_DIR="${AWS_NUKE_INSTALL_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/edu-cleanup
 AWS_NUKE_VERSION="${AWS_NUKE_VERSION:-latest}"
 AWS_NUKE_FALLBACK_VERSION="v3.68.3"   # used when "latest" cannot be resolved (verified version for this toolkit)
 
-# Lister errors that are expected noise in a standalone training account (reported, not counted as issues).
-KNOWN_NOISE='["FMSPolicy","FMSNotificationChannel","ShieldProtection","ShieldProtectionGroup","ServiceCatalogTagOption","ServiceCatalogTagOptionPortfolioAttachment","QBusinessApplication","QBusinessIndex","QBusinessDataSource","QBusinessPlugin","QBusinessRetriever","QBusinessWebExperience"]'
+# How lister errors ("listing failed") are classified: expected / maybe_scp / transient / unexpected (one place).
+LISTING_ERRORS="$SCRIPT_DIR/listing_errors.json"
 
 usage() {
   cat <<'EOF'
@@ -116,6 +116,7 @@ done
 for tool in aws jq python3; do
   command -v "$tool" >/dev/null 2>&1 || die "'$tool' not found in PATH"
 done
+LF_RULES="$(jq -c . "$LISTING_ERRORS")" || die "cannot read $LISTING_ERRORS"
 
 # ---------------------------------------------------------------------------------------------
 # AWS CLI calls run as the TARGET account: assume --role-arn once for the CLI (aws-nuke itself
@@ -364,7 +365,7 @@ REGIONS_JSON='{}'
 for owner in "${ALL_OWNERS[@]}"; do
   read -r rc dur <"$LOG_DIR/$owner.rc" || { rc=2; dur=0; }
   one="$(jq -R -s -f "$SCRIPT_DIR/summarize.jq" --arg applied "$APPLIED_STR" \
-          --argjson exit_code "$rc" --argjson known_noise "$KNOWN_NOISE" "$LOG_DIR/$owner.jsonl")" \
+          --argjson exit_code "$rc" --argjson rules "$LF_RULES" "$LOG_DIR/$owner.jsonl")" \
     || one='{"exit_code":2,"outcome":"error","errors":["could not parse the aws-nuke log"],"counts":{}}'
   stderr_tail="$(tail -c 2000 "$LOG_DIR/$owner.stderr" 2>/dev/null || true)"
   REGIONS_JSON="$(jq --arg o "$owner" --argjson one "$one" --argjson d "$dur" --arg st "$stderr_tail" \

@@ -148,10 +148,17 @@ resource-types:
     - "MediaStore*"
     - "InspectorAssessment*"
     - "AppMesh*"
+    - "LexBot"
+    - "LexIntent"
+    - "LexSlotType"
+    - "LexModelBuildingServiceBotAlias"
+    - "GlueDevEndpoint"
     - "Cloud9Environment"
     - "CloudSearchDomain"
     - "DataPipelinePipeline"
     - "MachineLearning*"
+    - "CloudDirectoryDirectory"
+    - "CloudDirectorySchema"
     - "AWS::Timestream::*"
     - "FMS*"
     - "ShieldProtection*"
@@ -195,37 +202,114 @@ nuke() {  # $1 = dry|apply
     --max-wait-retries "$MAX_WAIT_RETRIES" --parallel-queries "$PARALLEL_QUERIES" --log-format json \
     > "$W/$mode-global.jsonl" 2> "$W/$mode-global.stderr" < /dev/null; echo $? > "$W/$mode-global.rc"
 }
-# summary: last state per item (type+owner+name), "listing failed" lines by resource_type
+# listing-error rules (= nuke/listing_errors.json; a test checks that the copies are identical)
+IFS= read -r -d '' LF_RULES <<'JSON' || true
+{
+  "_doc": [
+    "How summarize.jq (and the inlined copy in cloudshell-oneshot.sh) classifies aws-nuke listing-failed (lister) errors.",
+    "One lister error = {resource_type, error}. First match wins, in this order:",
+    "  known_noise_types (exact type name) -> expected",
+    "  expected   regex on the raw error -> the API does not exist / is not offered for this account in this region: nothing can hide there",
+    "  maybe_scp  regex -> access denied WITHOUT a reason: an SCP of the reseller Organization OR regional gating. Shown on one quiet line",
+    "  transient  regex -> 5xx / throttling: a real failure (counted in LIST-ERR) but listed on one line - re-run to confirm",
+    "  anything else -> unexpected: one LISTING FAILED line per type, counted in LIST-ERR (resources of that type were NOT scanned)",
+    "Regexes are jq/Oniguruma (case-sensitive unless (?i:...)); $ = end of string, so use (?:\\n|$) for end of line.",
+    "Samples: real CloudShell dry-run, aws-nuke v3.68.3, 17 regions, 2026-10-15 (tests/fixtures/real-cloudshell-v3.68.3-listing-failed.jsonl).",
+    "cloudshell-oneshot.sh embeds this file verbatim in a quoted heredoc - keep the copies identical (a test compares them)."
+  ],
+  "known_noise_types": [
+    "FMSPolicy", "FMSNotificationChannel", "ShieldProtection", "ShieldProtectionGroup",
+    "ServiceCatalogTagOption", "ServiceCatalogTagOptionPortfolioAttachment",
+    "QBusinessApplication", "QBusinessIndex", "QBusinessDataSource", "QBusinessPlugin", "QBusinessRetriever",
+    "QBusinessWebExperience"
+  ],
+  "expected": [
+    {"re": "no such host|DNS lookup failed",
+     "why": "the service has no endpoint in this region"},
+    {"re": "UnknownOperationException|(?i:unknown operation)",
+     "why": "API not offered in this region (Bedrock custom models / model customization: 404 UnknownOperationException or ValidationException Unknown operation)"},
+    {"re": "InvalidAction: The action \\w+ is not valid for this web service",
+     "why": "EC2 API not offered in this region (Verified Access in ap-northeast-3, eu-west-3)"},
+    {"re": "Unrecognized engine name",
+     "why": "DocumentDB is not offered in this region (us-west-1: DescribeDBClusters -> Unrecognized engine name: docdb)"},
+    {"re": "is not authorized for region",
+     "why": "account not onboarded for the service in this region (Cloud Directory: Account N is not authorized for region R)"},
+    {"re": "(?i:account is(?:n.t| not) authorized to (?:call this operation|make this call|invoke this API operation))",
+     "why": "service-side regional/feature gating, not IAM and not an SCP (those say is not authorized to perform ...): Comprehend NotAuthorizedException, Transcribe language models, Bedrock evaluation jobs"},
+    {"re": "operation is currently disabled",
+     "why": "API switched off by AWS (Glue GetDevEndpoints)"}
+  ],
+  "maybe_scp": [
+    {"re": "service control policy",
+     "why": "explicit deny by an SCP of the Organization the account belongs to - we cannot list, students usually cannot create either"},
+    {"re": "AccessDenied(?:Exception)?:?[ \\t]*(?:\\n|$)",
+     "why": "AccessDenied with an EMPTY message (Rekognition, Textract, Timestream for InfluxDB): an SCP deny or a region where the account is not enabled - cannot tell which"},
+    {"re": "Unable to determine service/operation name to be authorized",
+     "why": "403 from the authorization layer (SSM Quick Setup in ap-northeast-3): usually a region without the service, possibly an SCP"}
+  ],
+  "transient": [
+    {"re": "(?i:status ?code: ?5[0-9][0-9])",
+     "why": "HTTP 5xx from the service (Bedrock prompts/flow aliases in us-west-1 returned 500)"},
+    {"re": "InternalServerError|InternalFailure|ServiceUnavailable",
+     "why": "server-side error"},
+    {"re": "Throttling|Rate exceeded|TooManyRequests|RequestLimitExceeded|SlowDown",
+     "why": "throttled - lower --parallel-queries or re-run"}
+  ]
+}
+JSON
+# summary: last state per item (type+owner+name); "listing failed" by resource_type, classified with LF_RULES:
+#   expected (not offered here) / maybe SCP (empty AccessDenied) / 5xx+throttling / unexpected (one line each)
 summary() {  # $1 = dry|apply
   local mode="$1" r
-  if [ "$mode" = apply ]; then printf '\n%-16s %4s %8s %7s %6s %6s %9s\n' REGION EXIT REMOVED FAILED LEFT KEPT LIST-ERR
-  else printf '\n%-16s %4s %13s %6s %9s\n' REGION EXIT WOULD-DELETE KEPT LIST-ERR; fi
+  if [ "$mode" = apply ]; then printf '\n%-16s %4s %8s %7s %6s %6s %9s %8s\n' REGION EXIT REMOVED FAILED LEFT KEPT LIST-ERR EXP/SCP
+  else printf '\n%-16s %4s %13s %6s %9s %8s\n' REGION EXIT WOULD-DELETE KEPT LIST-ERR EXP/SCP; fi
   for r in $REGIONS global; do
-    jq -R -s -r --arg r "$r" --arg mode "$mode" --arg rc "$(cat "$W/$mode-$r.rc" 2>/dev/null || echo 2)" '
+    jq -R -s -r --arg r "$r" --arg mode "$mode" --arg rc "$(cat "$W/$mode-$r.rc" 2>/dev/null || echo 2)" --argjson rules "$LF_RULES" '
+      # BEGIN listing-error classification (cloudshell-oneshot.sh carries an identical copy - a test compares them)
+      # Rules: listing_errors.json. Input {type, error(raw)} -> "expected" | "maybe_scp" | "transient" | "unexpected"
+      def lf_bucket($rules):
+        (.error // "" | tostring) as $e | (.type // "") as $t
+        | if any(($rules.known_noise_types // [])[]; . == $t) then "expected"
+          elif any(($rules.expected // [])[]; .re as $re | $e | test($re)) then "expected"
+          elif any(($rules.maybe_scp // [])[]; .re as $re | $e | test($re)) then "maybe_scp"
+          elif any(($rules.transient // [])[]; .re as $re | $e | test($re)) then "transient"
+          else "unexpected" end;
+      def lf_rank: {"expected": 0, "maybe_scp": 1, "transient": 2, "unexpected": 3}[.] // 3;
+      # END listing-error classification
       [splits("\n") | select(length>0) | (try fromjson catch null) | select(type=="object")] as $ev
       | ([$ev[] | select((.type|type)=="string" and (.state|type)=="string")]
          | reduce .[] as $e ({}; .[$e.type+"|"+($e.owner//"")+"|"+($e.name//"")] = $e) | [.[]]) as $it
       | def n(s): [$it[] | select(.state|IN(s))] | length;
         def by(s): [$it[] | select(.state|IN(s)) | .type] | group_by(.) | map("\(.[0]) \(length)") | join(", ");
-      ([$ev[] | select(.level=="error" and ((.msg//"")|startswith("listing failed"))) | .resource_type] | unique) as $lf
+      ([$ev[] | select(.level=="error" and ((.msg//"")|startswith("listing failed")))
+        | {type: (.resource_type // "?"), error: ((.error // .msg) | tostring)} | . + {bucket: lf_bucket($rules)}]
+       | group_by(.type) | map((map(.bucket|lf_rank)|max) as $m | map(select((.bucket|lf_rank)==$m)) | .[0])) as $lf
+      | def lb(b): [$lf[] | select(.bucket==b) | .type];
+      ((lb("transient")+lb("unexpected"))|length) as $nerr
+      | ([(lb("expected")|length),(lb("maybe_scp")|length)] | if add==0 then "-" else "\(.[0])/\(.[1])" end) as $exp
       | (if $mode=="apply"
-         then ["ROW",$r,$rc,n("finished"),n("failed"),n("new","new-dependency","pending","waiting","hold","pending-dependency"),n("filtered"),($lf|length)]
-         else ["ROW",$r,$rc,n("new","new-dependency"),n("filtered"),($lf|length)] end | map(tostring) | join("\t")),
+         then ["ROW",$r,$rc,n("finished"),n("failed"),n("new","new-dependency","pending","waiting","hold","pending-dependency"),n("filtered"),$nerr,$exp]
+         else ["ROW",$r,$rc,n("new","new-dependency"),n("filtered"),$nerr,$exp] end | map(tostring) | join("\t")),
         (if $mode=="dry" and by("new","new-dependency")!="" then "    would delete: \(by("new","new-dependency"))" else empty end),
         (if $mode=="apply" and by("failed")!="" then "    FAILED: \(by("failed"))" else empty end),
         (if $mode=="apply" and by("new","pending","waiting","hold")!="" then "    NOT FINISHED: \(by("new","pending","waiting","hold"))" else empty end),
-        (if ($lf|length)>0 then "    listing failed (usually: service not used/subscribed): \($lf|join(", "))" else empty end),
+        (lb("expected") | if length>0 then "    listing failed (expected - service not used/subscribed): \(join(", "))" else empty end),
+        (lb("maybe_scp") | if length>0 then "    access denied (maybe SCP): \(join(", "))" else empty end),
+        (lb("transient") | if length>0 then "    LISTING FAILED (5xx/throttling - re-run to confirm): \(join(", "))" else empty end),
+        ($lf[] | select(.bucket=="unexpected")
+         | "    LISTING FAILED \(.type): \(.error | split("\n") | map(gsub("^\\s+";"")|select(length>0)) | .[0:3] | join(" | ") | .[0:300])"),
         ([$ev[] | select(.level=="fatal") | .msg] | unique | .[] | "    aws-nuke stopped: \(.)")
     ' "$W/$mode-$r.jsonl" | while IFS= read -r line; do
       case "$line" in
-        ROW*) IFS=$'\t' read -r _ a b c d e f g <<<"$line"
-              if [ "$mode" = apply ]; then printf '%-16s %4s %8s %7s %6s %6s %9s\n' "$a" "$b" "$c" "$d" "$e" "$f" "$g"
-              else printf '%-16s %4s %13s %6s %9s\n' "$a" "$b" "$c" "$d" "$e"; fi ;;
+        ROW*) IFS=$'\t' read -r _ a b c d e f g h <<<"$line"
+              if [ "$mode" = apply ]; then printf '%-16s %4s %8s %7s %6s %6s %9s %8s\n' "$a" "$b" "$c" "$d" "$e" "$f" "$g" "$h"
+              else printf '%-16s %4s %13s %6s %9s %8s\n' "$a" "$b" "$c" "$d" "$e" "$f"; fi ;;
         *) printf '%s\n' "$line" ;;
       esac
     done
     [ "$(cat "$W/$mode-$r.rc" 2>/dev/null)" = 0 ] || [ ! -s "$W/$mode-$r.stderr" ] || { echo "    stderr:"; tail -n 3 "$W/$mode-$r.stderr" | sed 's/^/      /'; }
   done
+  echo "LIST-ERR = lister failures that may hide resources (re-run / check them); EXP/SCP = not offered here / access denied (maybe SCP)"
 }
 
 T0=$SECONDS; nuke dry; say "== DRY-RUN done in $((SECONDS - T0))s - nothing was deleted =="; summary dry

@@ -153,6 +153,12 @@ def test_dry_run_parallel_then_global(fakes):
                  "--parallel-queries 24"):
         assert flag in log, flag
     assert "WOULD-DELETE" in p.stdout and "RESULT: OK" in p.stdout
+    # lister errors are classified with listing_errors.json (FMSPolicy = known noise -> expected, not LIST-ERR)
+    us = res["regions"]["us-east-1"]
+    assert us["listing_failed_by_bucket"] == {"expected": 1, "maybe_scp": 0, "transient": 0, "unexpected": 0}
+    assert us["listing_failed_unexpected"] == [] and res["totals"]["listing_failed_unexpected"] == 0
+    assert res["totals"]["listing_failed_by_bucket"]["expected"] == 3
+    assert "listing failed (expected - service not used/subscribed): FMSPolicy" in p.stdout
 
 
 @needs_tools
@@ -331,3 +337,58 @@ def test_readme_contains_the_cloudshell_block_verbatim():
     assert begin in readme and end in readme
     embedded = readme.split(begin, 1)[1].split(end, 1)[0]
     assert embedded == ONESHOT.read_text(), "README block is stale - re-copy cloudshell-oneshot.sh into README.md"
+
+
+# ------------------------------------------------------------------ listing-error classification in the oneshot
+LF_BEGIN, LF_END = "# BEGIN listing-error classification", "# END listing-error classification"
+
+
+def _lf_block(text):
+    block = text[text.index(LF_BEGIN):text.index(LF_END) + len(LF_END)]
+    return [ln.strip() for ln in block.splitlines()]
+
+
+def test_oneshot_embeds_the_listing_error_rules_verbatim():
+    text = ONESHOT.read_text()
+    embedded = text.split("<<'JSON' || true\n", 1)[1].split("\nJSON\n", 1)[0] + "\n"
+    assert embedded == (NUKE_DIR / "listing_errors.json").read_text(), \
+        "re-copy nuke/listing_errors.json into cloudshell-oneshot.sh (LF_RULES heredoc)"
+    assert "\nJSON\n" not in (NUKE_DIR / "listing_errors.json").read_text()
+
+
+def test_oneshot_classification_is_the_same_jq_as_summarize():
+    assert _lf_block(ONESHOT.read_text()) == _lf_block((NUKE_DIR / "summarize.jq").read_text())
+    # the jq program is single-quoted in bash: the shared block must not contain a single quote
+    assert "'" not in "\n".join(_lf_block(ONESHOT.read_text()))
+
+
+@needs_tools
+def test_oneshot_summary_buckets(tmp_path):
+    """The oneshot summary() on real lister errors: compact lines, LIST-ERR = real failures only."""
+    from nuke_test_support import FIXTURES
+    w = tmp_path / "w"
+    w.mkdir()
+    evs = [json.loads(ln) for ln in (FIXTURES / "real-cloudshell-v3.68.3-listing-failed.jsonl").read_text().splitlines()]
+    regions = ["us-west-1", "ap-northeast-3", "us-east-1"]
+    for r in regions + ["global"]:
+        lines = [json.dumps(e) for e in evs if e["owner"] == r]
+        if r == "us-east-1":   # plus one error no rule knows -> its own line
+            lines.append(json.dumps({"error": "ResourceNotFoundException: odd", "level": "error", "owner": r,
+                                     "msg": "listing failed:\n    ResourceNotFoundException: odd",
+                                     "resource_type": "GlueJob", "time": "t"}))
+        (w / f"dry-{r}.jsonl").write_text("\n".join(lines) + "\n")
+        (w / f"dry-{r}.rc").write_text("0\n")
+    text = ONESHOT.read_text()
+    part = text[text.index("# listing-error rules"):text.index("T0=$SECONDS; nuke dry;")]
+    script = tmp_path / "s.sh"
+    script.write_text(f'set -uo pipefail\nW="{w}"\nREGIONS="{" ".join(regions)}"\n{part}summary dry\n')
+    out = subprocess.run(["bash", str(script)], capture_output=True, text=True, check=True, timeout=60).stdout
+    rows = {ln.split()[0]: ln.split() for ln in out.splitlines() if ln[:1].isalpha() and ln.split()[0] in regions + ["global"]}
+    assert rows["us-west-1"][-2:] == ["2", "9/3"]          # 2 x HTTP 500; DocDB/Bedrock/Comprehend/Glue expected
+    assert rows["ap-northeast-3"][-2:] == ["0", "8/1"]
+    assert rows["us-east-1"][-2:] == ["5", "3/0"]          # 4 x Lex V1 503 + GlueJob
+    assert rows["global"][-2:] == ["0", "-"]
+    assert "    access denied (maybe SCP): RekognitionDataset, RekognitionProject, TimestreamInfluxDBDbInstance" in out
+    assert "    LISTING FAILED (5xx/throttling - re-run to confirm): BedrockFlowAlias, BedrockPrompt" in out
+    assert "    LISTING FAILED GlueJob: ResourceNotFoundException: odd" in out
+    assert out.count("LISTING FAILED ") == 3                # 2 collapsed 5xx lines + 1 unexpected

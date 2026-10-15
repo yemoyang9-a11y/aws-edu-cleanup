@@ -8,7 +8,9 @@
 #   ERROR  2  any region ended with outcome "error" (aws-nuke could not run / crashed / refused the account)
 #   ISSUES 1  apply only: failed or unfinished items remain, or aws-nuke gave up (failed / max wait retries)
 #   OK     0  dry-run finished in every region, or apply removed everything it found
-# Lister errors ("listing failed") never change the status; they are reported per type.
+# Lister errors ("listing failed") never change the status; they are reported per type and per bucket
+# (expected / maybe_scp / transient / unexpected - see listing_errors.json). totals.listing_failed_unexpected =
+# transient + unexpected types summed over regions (= the LIST-ERR column).
 
 def num($s): ($s // "0") | tonumber? // 0;
 
@@ -40,7 +42,9 @@ def num($s): ($s // "0") | tonumber? // 0;
       failed: ($r | map(.counts.failed // 0) | add // 0),
       remaining: ($r | map(.counts.remaining // 0) | add // 0),
       listing_failed: ($r | map(.counts.listing_failed // 0) | add // 0),
-      listing_failed_unexpected: ($r | map(.listing_failed_unexpected // [] | length) | add // 0)
+      listing_failed_unexpected: ($r | map(.listing_failed_unexpected // [] | length) | add // 0),
+      listing_failed_by_bucket: (["expected", "maybe_scp", "transient", "unexpected"]
+        | map(. as $k | {key: $k, value: ($r | map(.listing_failed_by_bucket[$k]? // 0) | add // 0)}) | from_entries)
     },
     regions: $regions
   }

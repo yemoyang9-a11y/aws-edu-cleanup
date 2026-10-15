@@ -9,6 +9,7 @@ CloudFormation 스택은 이 모듈보다 **먼저** `cfn_predelete/`가 병렬�
 | `run_nuke.sh` | 실행기. aws-nuke 설치, 별칭 확인, 리전별 설정 생성, **리전 병렬 실행 후 global 마지막**, JSON 로그 요약, 결과 JSON |
 | `cloudshell-oneshot.sh` | CloudShell에 통째로 붙여 넣는 단일 블록. 설정이 내장되어 있어 다른 파일이 필요 없다 |
 | `summarize.jq`, `result.jq`, `table.jq` | 로그 요약(리전 하나), 결과 JSON 조립과 상태 판정, 사람이 읽을 표 |
+| `listing_errors.json` | "listing failed"(lister 에러) 분류 규칙(정규식 목록)을 **한 곳에** 모은 파일. CloudShell 블록에도 그대로 들어 있다 |
 | `tests/` | pytest. 실제 aws-nuke v3.68.3 바이너리가 만든 JSON 로그를 fixture로 쓴다 |
 
 모든 리소스 타입 이름, 설정(setting) 이름, 필터 속성, CLI 플래그, 로그 필드는 **aws-nuke v3.68.3 소스와 libnuke v1.3.0 소스**로 확인했다. 릴리스 바이너리(`explain-config`, moto 대상 실제 실행)로도 검증했다.
@@ -24,7 +25,7 @@ CloudFormation 스택은 이 모듈보다 **먼저** `cfn_predelete/`가 병렬�
 | `--max-wait-retries 120` | 기본값 0은 **영원히 기다린다**. 120이면 새 진척 없는 패스가 120번(약 10분 이상) 이어질 때 멈춘다 |
 | `--prompt-delay 3`(최솟값) | 스캔 전과 삭제 전에 기본 10초씩 쉬던 시간을 줄인다 |
 | `--parallel-queries 24`(기본 16) | 리전 안에서 동시에 도는 lister 수. 숨김 플래그라 기본값으로는 16이다. EC2 스로틀링을 고려해 32 미만으로 둔다 |
-| `--log-format json` + jq 요약 | `grep -v` 대신 타입별 집계를 낸다. 예상된 lister 에러와 예상 밖의 에러를 나눠 보여 준다 |
+| `--log-format json` + jq 요약 | `grep -v` 대신 타입별 집계를 낸다. lister 에러를 예상됨 / SCP 의심 / 5xx / 예상 밖으로 나눠 리전마다 몇 줄로 보여 주고, LIST-ERR에는 리소스를 숨길 수 있는 것만 센다 |
 | 삭제·종료 보호 해제 설정 추가 | EC2, RDS(+정지된 Aurora 클러스터 시작), CFN, DynamoDB, ELBv2, EKS, 로그 그룹, Cognito, DocDB, Neptune, QuickSight, S3 Object Lock, KMS 등 |
 | 실행자(IAM 사용자 또는 역할) 자동 보호 | CloudShell에서 IAM 사용자로 돌리면 그 사용자의 정책·그룹·키·비밀번호·MFA가 지워져 **실행 도중 권한을 잃는다** |
 | 별칭이 없으면 `edu-<계정ID>` 생성(삭제 단계에서만) | aws-nuke는 별칭 없는 계정을 거부한다. dry-run은 계정을 바꾸지 않도록 `--no-alias-check`로 우회한다 |
@@ -238,10 +239,17 @@ resource-types:
     - "MediaStore*"
     - "InspectorAssessment*"
     - "AppMesh*"
+    - "LexBot"
+    - "LexIntent"
+    - "LexSlotType"
+    - "LexModelBuildingServiceBotAlias"
+    - "GlueDevEndpoint"
     - "Cloud9Environment"
     - "CloudSearchDomain"
     - "DataPipelinePipeline"
     - "MachineLearning*"
+    - "CloudDirectoryDirectory"
+    - "CloudDirectorySchema"
     - "AWS::Timestream::*"
     - "FMS*"
     - "ShieldProtection*"
@@ -285,37 +293,114 @@ nuke() {  # $1 = dry|apply
     --max-wait-retries "$MAX_WAIT_RETRIES" --parallel-queries "$PARALLEL_QUERIES" --log-format json \
     > "$W/$mode-global.jsonl" 2> "$W/$mode-global.stderr" < /dev/null; echo $? > "$W/$mode-global.rc"
 }
-# summary: last state per item (type+owner+name), "listing failed" lines by resource_type
+# listing-error rules (= nuke/listing_errors.json; a test checks that the copies are identical)
+IFS= read -r -d '' LF_RULES <<'JSON' || true
+{
+  "_doc": [
+    "How summarize.jq (and the inlined copy in cloudshell-oneshot.sh) classifies aws-nuke listing-failed (lister) errors.",
+    "One lister error = {resource_type, error}. First match wins, in this order:",
+    "  known_noise_types (exact type name) -> expected",
+    "  expected   regex on the raw error -> the API does not exist / is not offered for this account in this region: nothing can hide there",
+    "  maybe_scp  regex -> access denied WITHOUT a reason: an SCP of the reseller Organization OR regional gating. Shown on one quiet line",
+    "  transient  regex -> 5xx / throttling: a real failure (counted in LIST-ERR) but listed on one line - re-run to confirm",
+    "  anything else -> unexpected: one LISTING FAILED line per type, counted in LIST-ERR (resources of that type were NOT scanned)",
+    "Regexes are jq/Oniguruma (case-sensitive unless (?i:...)); $ = end of string, so use (?:\\n|$) for end of line.",
+    "Samples: real CloudShell dry-run, aws-nuke v3.68.3, 17 regions, 2026-10-15 (tests/fixtures/real-cloudshell-v3.68.3-listing-failed.jsonl).",
+    "cloudshell-oneshot.sh embeds this file verbatim in a quoted heredoc - keep the copies identical (a test compares them)."
+  ],
+  "known_noise_types": [
+    "FMSPolicy", "FMSNotificationChannel", "ShieldProtection", "ShieldProtectionGroup",
+    "ServiceCatalogTagOption", "ServiceCatalogTagOptionPortfolioAttachment",
+    "QBusinessApplication", "QBusinessIndex", "QBusinessDataSource", "QBusinessPlugin", "QBusinessRetriever",
+    "QBusinessWebExperience"
+  ],
+  "expected": [
+    {"re": "no such host|DNS lookup failed",
+     "why": "the service has no endpoint in this region"},
+    {"re": "UnknownOperationException|(?i:unknown operation)",
+     "why": "API not offered in this region (Bedrock custom models / model customization: 404 UnknownOperationException or ValidationException Unknown operation)"},
+    {"re": "InvalidAction: The action \\w+ is not valid for this web service",
+     "why": "EC2 API not offered in this region (Verified Access in ap-northeast-3, eu-west-3)"},
+    {"re": "Unrecognized engine name",
+     "why": "DocumentDB is not offered in this region (us-west-1: DescribeDBClusters -> Unrecognized engine name: docdb)"},
+    {"re": "is not authorized for region",
+     "why": "account not onboarded for the service in this region (Cloud Directory: Account N is not authorized for region R)"},
+    {"re": "(?i:account is(?:n.t| not) authorized to (?:call this operation|make this call|invoke this API operation))",
+     "why": "service-side regional/feature gating, not IAM and not an SCP (those say is not authorized to perform ...): Comprehend NotAuthorizedException, Transcribe language models, Bedrock evaluation jobs"},
+    {"re": "operation is currently disabled",
+     "why": "API switched off by AWS (Glue GetDevEndpoints)"}
+  ],
+  "maybe_scp": [
+    {"re": "service control policy",
+     "why": "explicit deny by an SCP of the Organization the account belongs to - we cannot list, students usually cannot create either"},
+    {"re": "AccessDenied(?:Exception)?:?[ \\t]*(?:\\n|$)",
+     "why": "AccessDenied with an EMPTY message (Rekognition, Textract, Timestream for InfluxDB): an SCP deny or a region where the account is not enabled - cannot tell which"},
+    {"re": "Unable to determine service/operation name to be authorized",
+     "why": "403 from the authorization layer (SSM Quick Setup in ap-northeast-3): usually a region without the service, possibly an SCP"}
+  ],
+  "transient": [
+    {"re": "(?i:status ?code: ?5[0-9][0-9])",
+     "why": "HTTP 5xx from the service (Bedrock prompts/flow aliases in us-west-1 returned 500)"},
+    {"re": "InternalServerError|InternalFailure|ServiceUnavailable",
+     "why": "server-side error"},
+    {"re": "Throttling|Rate exceeded|TooManyRequests|RequestLimitExceeded|SlowDown",
+     "why": "throttled - lower --parallel-queries or re-run"}
+  ]
+}
+JSON
+# summary: last state per item (type+owner+name); "listing failed" by resource_type, classified with LF_RULES:
+#   expected (not offered here) / maybe SCP (empty AccessDenied) / 5xx+throttling / unexpected (one line each)
 summary() {  # $1 = dry|apply
   local mode="$1" r
-  if [ "$mode" = apply ]; then printf '\n%-16s %4s %8s %7s %6s %6s %9s\n' REGION EXIT REMOVED FAILED LEFT KEPT LIST-ERR
-  else printf '\n%-16s %4s %13s %6s %9s\n' REGION EXIT WOULD-DELETE KEPT LIST-ERR; fi
+  if [ "$mode" = apply ]; then printf '\n%-16s %4s %8s %7s %6s %6s %9s %8s\n' REGION EXIT REMOVED FAILED LEFT KEPT LIST-ERR EXP/SCP
+  else printf '\n%-16s %4s %13s %6s %9s %8s\n' REGION EXIT WOULD-DELETE KEPT LIST-ERR EXP/SCP; fi
   for r in $REGIONS global; do
-    jq -R -s -r --arg r "$r" --arg mode "$mode" --arg rc "$(cat "$W/$mode-$r.rc" 2>/dev/null || echo 2)" '
+    jq -R -s -r --arg r "$r" --arg mode "$mode" --arg rc "$(cat "$W/$mode-$r.rc" 2>/dev/null || echo 2)" --argjson rules "$LF_RULES" '
+      # BEGIN listing-error classification (cloudshell-oneshot.sh carries an identical copy - a test compares them)
+      # Rules: listing_errors.json. Input {type, error(raw)} -> "expected" | "maybe_scp" | "transient" | "unexpected"
+      def lf_bucket($rules):
+        (.error // "" | tostring) as $e | (.type // "") as $t
+        | if any(($rules.known_noise_types // [])[]; . == $t) then "expected"
+          elif any(($rules.expected // [])[]; .re as $re | $e | test($re)) then "expected"
+          elif any(($rules.maybe_scp // [])[]; .re as $re | $e | test($re)) then "maybe_scp"
+          elif any(($rules.transient // [])[]; .re as $re | $e | test($re)) then "transient"
+          else "unexpected" end;
+      def lf_rank: {"expected": 0, "maybe_scp": 1, "transient": 2, "unexpected": 3}[.] // 3;
+      # END listing-error classification
       [splits("\n") | select(length>0) | (try fromjson catch null) | select(type=="object")] as $ev
       | ([$ev[] | select((.type|type)=="string" and (.state|type)=="string")]
          | reduce .[] as $e ({}; .[$e.type+"|"+($e.owner//"")+"|"+($e.name//"")] = $e) | [.[]]) as $it
       | def n(s): [$it[] | select(.state|IN(s))] | length;
         def by(s): [$it[] | select(.state|IN(s)) | .type] | group_by(.) | map("\(.[0]) \(length)") | join(", ");
-      ([$ev[] | select(.level=="error" and ((.msg//"")|startswith("listing failed"))) | .resource_type] | unique) as $lf
+      ([$ev[] | select(.level=="error" and ((.msg//"")|startswith("listing failed")))
+        | {type: (.resource_type // "?"), error: ((.error // .msg) | tostring)} | . + {bucket: lf_bucket($rules)}]
+       | group_by(.type) | map((map(.bucket|lf_rank)|max) as $m | map(select((.bucket|lf_rank)==$m)) | .[0])) as $lf
+      | def lb(b): [$lf[] | select(.bucket==b) | .type];
+      ((lb("transient")+lb("unexpected"))|length) as $nerr
+      | ([(lb("expected")|length),(lb("maybe_scp")|length)] | if add==0 then "-" else "\(.[0])/\(.[1])" end) as $exp
       | (if $mode=="apply"
-         then ["ROW",$r,$rc,n("finished"),n("failed"),n("new","new-dependency","pending","waiting","hold","pending-dependency"),n("filtered"),($lf|length)]
-         else ["ROW",$r,$rc,n("new","new-dependency"),n("filtered"),($lf|length)] end | map(tostring) | join("\t")),
+         then ["ROW",$r,$rc,n("finished"),n("failed"),n("new","new-dependency","pending","waiting","hold","pending-dependency"),n("filtered"),$nerr,$exp]
+         else ["ROW",$r,$rc,n("new","new-dependency"),n("filtered"),$nerr,$exp] end | map(tostring) | join("\t")),
         (if $mode=="dry" and by("new","new-dependency")!="" then "    would delete: \(by("new","new-dependency"))" else empty end),
         (if $mode=="apply" and by("failed")!="" then "    FAILED: \(by("failed"))" else empty end),
         (if $mode=="apply" and by("new","pending","waiting","hold")!="" then "    NOT FINISHED: \(by("new","pending","waiting","hold"))" else empty end),
-        (if ($lf|length)>0 then "    listing failed (usually: service not used/subscribed): \($lf|join(", "))" else empty end),
+        (lb("expected") | if length>0 then "    listing failed (expected - service not used/subscribed): \(join(", "))" else empty end),
+        (lb("maybe_scp") | if length>0 then "    access denied (maybe SCP): \(join(", "))" else empty end),
+        (lb("transient") | if length>0 then "    LISTING FAILED (5xx/throttling - re-run to confirm): \(join(", "))" else empty end),
+        ($lf[] | select(.bucket=="unexpected")
+         | "    LISTING FAILED \(.type): \(.error | split("\n") | map(gsub("^\\s+";"")|select(length>0)) | .[0:3] | join(" | ") | .[0:300])"),
         ([$ev[] | select(.level=="fatal") | .msg] | unique | .[] | "    aws-nuke stopped: \(.)")
     ' "$W/$mode-$r.jsonl" | while IFS= read -r line; do
       case "$line" in
-        ROW*) IFS=$'\t' read -r _ a b c d e f g <<<"$line"
-              if [ "$mode" = apply ]; then printf '%-16s %4s %8s %7s %6s %6s %9s\n' "$a" "$b" "$c" "$d" "$e" "$f" "$g"
-              else printf '%-16s %4s %13s %6s %9s\n' "$a" "$b" "$c" "$d" "$e"; fi ;;
+        ROW*) IFS=$'\t' read -r _ a b c d e f g h <<<"$line"
+              if [ "$mode" = apply ]; then printf '%-16s %4s %8s %7s %6s %6s %9s %8s\n' "$a" "$b" "$c" "$d" "$e" "$f" "$g" "$h"
+              else printf '%-16s %4s %13s %6s %9s %8s\n' "$a" "$b" "$c" "$d" "$e" "$f"; fi ;;
         *) printf '%s\n' "$line" ;;
       esac
     done
     [ "$(cat "$W/$mode-$r.rc" 2>/dev/null)" = 0 ] || [ ! -s "$W/$mode-$r.stderr" ] || { echo "    stderr:"; tail -n 3 "$W/$mode-$r.stderr" | sed 's/^/      /'; }
   done
+  echo "LIST-ERR = lister failures that may hide resources (re-run / check them); EXP/SCP = not offered here / access denied (maybe SCP)"
 }
 
 T0=$SECONDS; nuke dry; say "== DRY-RUN done in $((SECONDS - T0))s - nothing was deleted =="; summary dry
@@ -352,8 +437,9 @@ exit "$RC"
 ## 제외 목록과 근거
 
 **제외한 타입은 절대 삭제되지 않는다.** 그래서 학생이 새 계정에서 **만들 수 없는** 것과 부모 리소스가 함께 지우는 것만 제외한다.
-Q Business, Glue, Timestream for InfluxDB, Inspector2, Redshift Serverless, CodeStar Connections처럼 **지금도 만들 수 있고 돈이 드는 서비스는 제외하지 않는다.** 이런 서비스는 lister 에러가 나도 그대로 둔다(아래 "알려진 한계").
-와일드카드는 libnuke가 등록된 타입 이름에 glob으로 펼친다. 실제로 펼친 결과는 `aws-nuke explain-config --with-excluded`로 확인했다(605개 중 44개 제외).
+Q Business, Glue(`GlueDevEndpoint`만 예외), Timestream for InfluxDB, Inspector2, Redshift Serverless, CodeStar Connections처럼 **지금도 만들 수 있고 돈이 드는 서비스는 제외하지 않는다.** 이런 서비스는 lister 에러가 나도 그대로 둔다(아래 "알려진 한계").
+일부 리전에서만 안 되는 서비스(Bedrock 모델 커스터마이징, Verified Access, us-west-1의 DocumentDB 등)도 제외하지 않는다. 다른 리전에서는 만들 수 있기 때문이다. 이런 에러는 요약에서 "예상됨"으로 분류한다(아래 "요약 읽는 법").
+와일드카드는 libnuke가 등록된 타입 이름에 glob으로 펼친다. 실제로 펼친 결과는 `aws-nuke explain-config --with-excluded`로 확인했다(605개 중 51개 제외).
 
 | 패턴 | 펼친 타입 | 근거 |
 |---|---|---|
@@ -367,10 +453,13 @@ Q Business, Glue, Timestream for InfluxDB, Inspector2, Redshift Serverless, Code
 | `MediaStore*` | 2 | 완전 종료(2025-11-12) |
 | `InspectorAssessment*` | 3 | Inspector Classic 완전 종료(2026-05-20). `Inspector2`는 제외하지 않는다 |
 | `AppMesh*` | 7 | App Mesh 지원 종료(2026-09-30) |
+| `LexBot`, `LexIntent`, `LexSlotType`, `LexModelBuildingServiceBotAlias` | 4 | Lex **V1**(lexmodelbuildingservice API) 지원 종료(2025-09-15). 실제 dry-run(2026-10-15)에서 모든 리전 503. v3.68.3에는 Lex V2 타입이 없고, 새 타입이 생겨도 걸리지 않게 `Lex*` 대신 정확한 이름으로 적었다 |
+| `GlueDevEndpoint` | 1 | 개발 엔드포인트는 Glue 0.9/1.0 전용인데 두 버전이 2026-04-01에 EOL. 실제 dry-run(2026-10-15)에서 17개 리전 모두 `GetDevEndpoints operation is currently disabled`. 다른 Glue 타입은 그대로 지운다 |
 | `Cloud9Environment` | 1 | 신규 고객 차단(2024-07-25) |
 | `CloudSearchDomain` | 1 | 신규 고객 차단(2024-07-25) |
 | `DataPipelinePipeline` | 1 | 신규 고객 차단 |
 | `MachineLearning*` | 4 | Amazon Machine Learning 신규 사용자 받지 않음 |
+| `CloudDirectoryDirectory`, `CloudDirectorySchema` | 2 | Cloud Directory 신규 고객 차단(지원 종료 2027-07-24, 2026-10-15 문서 확인). 실제 dry-run에서 모든 리전 `Account … is not authorized for region` |
 | `AWS::Timestream::*` | 3 | Timestream for LiveAnalytics 신규 고객 차단(2025-06-20). Cloud Control 타입 Database/Table/ScheduledQuery가 기본 등록되어 있다. `TimestreamInfluxDBDbInstance`는 남긴다 |
 | `FMS*` | 2 | Firewall Manager는 Organizations와 관리자 계정이 필요하다. 독립 계정에서는 List가 항상 실패한다 |
 | `ShieldProtection*` | 2 | Shield Advanced 구독이 있어야 한다. 보호 항목을 지워도 구독(1년 약정)은 끝나지 않으므로 해지 전 점검에서 따로 본다 |
@@ -404,32 +493,38 @@ Q Business, Glue, Timestream for InfluxDB, Inspector2, Redshift Serverless, Code
 
 ```
 == aws-nuke APPLY  account 123456789012 (edu-123456789012)  aws-nuke v3.68.3  412s ==
-REGION          EXIT  TIME     REMOVED  FAILED  LEFT  KEPT  LIST-ERR
-ap-northeast-2  1     388s          41       1     -     5         3
-us-east-1       0     120s           6       -     -     5         2
-global          0     24s           18       -     -    21         -
+REGION          EXIT  TIME     REMOVED  FAILED  LEFT  KEPT  LIST-ERR  EXP/SCP
+ap-northeast-2  1     388s          41       1     -     5         -      2/0
+us-west-1       0     120s           6       -     -     5         3      8/3
+global          0     24s           18       -     -    21         -        -
 
 [ap-northeast-2] removed: EC2SecurityGroup 9, EC2Subnet 6, ...
 [ap-northeast-2] FAILED: EC2VPC 1
 [ap-northeast-2]   x EC2VPC vpc-0abc...
-[ap-northeast-2] listing failed (expected - service not used/subscribed): FMSPolicy
-[us-east-1] LISTING FAILED GlueJob: ThrottlingException: Rate exceeded
+[ap-northeast-2] listing failed (expected - service not used/subscribed): BedrockCustomModel, BedrockModelCustomizationJob
+[us-west-1] listing failed (expected - service not used/subscribed): BedrockCustomModel, ..., DocDBCluster, DocDBInstance, ...
+[us-west-1] access denied (maybe SCP): RekognitionDataset, RekognitionProject, TimestreamInfluxDBDbInstance
+[us-west-1] LISTING FAILED (5xx/throttling - re-run to confirm): BedrockFlowAlias, BedrockPrompt
+[us-west-1] LISTING FAILED GlueJob: AccessDeniedException: User: arn:aws:sts::…:assumed-role/… is not authorized to perform: glue:GetJobs …
 RESULT: ISSUES (exit 1)  removed 65, failed 1, not finished 0
+LIST-ERR: 3 lister failure(s) - resources of those types were NOT scanned (see LISTING FAILED above)
 ```
 
 - **WOULD-DELETE / REMOVED**: 지울 예정이거나 지운 항목 수. 아래 줄에 타입별 개수가 나온다.
 - **FAILED**: 마지막 상태가 `failed`인 항목. aws-nuke(libnuke v1.3.0)는 실패한 항목만 남은 패스가 몇 번(2~3패스) 이어지면 포기한다. **한 번 더 돌리면** 대개 끝난다(의존성 순서 문제).
 - **LEFT**: apply에서 끝나지 않은 항목(`new`/`pending`/`waiting`/`hold`). 대개 `--max-wait-retries`에 걸린 경우다.
 - **KEPT**: 필터나 리소스 자체 규칙(기본 VPC 아님, AWS 관리형 등)으로 남긴 항목.
-- **LIST-ERR**: "listing failed" 줄 수. 해석은 두 가지로 나뉜다.
-  - `listing failed (expected …)`: 알려진 소음(FMS, Shield, ServiceCatalog TagOption, 구독하지 않은 Q Business)이거나, 그 리전에 엔드포인트가 없는 경우(DNS). 무시해도 된다.
-  - `LISTING FAILED <타입>: <에러>`: 예상하지 못한 lister 실패다. **이 타입의 리소스는 한 개도 발견되지 않았다는 뜻이다**(조용한 누락). 권한 문제나 스로틀링이면 다시 돌리고, 계속되면 `verify/`로 확인한다.
+- **LIST-ERR / EXP/SCP**: lister 에러("listing failed")를 `listing_errors.json`의 정규식으로 네 갈래로 나눈다. **LIST-ERR는 리소스를 숨길 수 있는 것(아래 3, 4)만 센다.** EXP/SCP는 1과 2의 타입 수다(`-`는 0). 리전마다 1~3은 한 줄씩, 4는 타입마다 한 줄이다.
+  1. `listing failed (expected - service not used/subscribed)`: 그 리전에 API가 없거나 이 계정에 열려 있지 않다(`UnknownOperationException`, `InvalidAction … not valid for this web service`, `Unrecognized engine name`, `not authorized for region`, Comprehend·Transcribe·Bedrock의 `account is not authorized to …`, `is currently disabled`, DNS 실패). 알려진 소음(FMS, Shield, ServiceCatalog TagOption, Q Business)도 여기 들어간다. **무시해도 된다.** 그 리전에서는 만들 수 없으니 숨은 리소스도 없다.
+  2. `access denied (maybe SCP)`: 이유 없는 `AccessDeniedException`(Rekognition, Textract, Timestream for InfluxDB), SSM Quick Setup의 403, `service control policy` 문구가 있는 거부. 학생 계정은 리셀러 Organization의 멤버라 **우리가 모르는 SCP**가 있을 수 있고, 리전이 막힌 경우와 구분이 안 된다. 종료 코드와 LIST-ERR에는 넣지 않는다. 대개 무시해도 되지만, 그 리전에서 학생이 해당 서비스를 썼을 수 있으면 콘솔에서 한 번 보거나 `verify/`(D+2 비용)로 확인한다.
+  3. `LISTING FAILED (5xx/throttling - re-run to confirm)`: 5xx·스로틀링. 일시적인 경우가 많지만 이번 스캔에서 그 타입은 **확인되지 않았다**. 다시 돌려서 사라지는지 본다.
+  4. `LISTING FAILED <타입>: <에러>`: 어떤 규칙에도 안 맞는 실패(예: 역할에 권한이 없는 `… is not authorized to perform …`). **이 타입의 리소스는 한 개도 발견되지 않았다는 뜻이다**(조용한 누락). 원인을 고쳐 다시 돌리고, 계속되면 `verify/`로 확인한다. 반복해서 나오는데 리전 제한이 확실한 에러라면 `listing_errors.json`의 `expected`에 정규식과 근거(`why`)를 추가한다(CloudShell 블록의 사본도 같이 고친다. 테스트가 비교한다).
 - **EXIT**: 리전별 aws-nuke 종료 코드. `aws-nuke stopped: failed`는 실패 포기, `max wait retries of 120 exceeded`는 대기 포기다. 그 밖의 fatal(예: `account is in blocklist`)은 오류다.
-- 결과 JSON의 `regions.<리전>`에는 `outcome`(`completed`/`gave_up_failed`/`gave_up_wait`/`error`), `*_by_type`, `failed_items`, `listing_failed_by_type`(첫 에러 메시지), `listing_failed_unexpected`, `log`, `config`가 들어 있다.
+- 결과 JSON의 `regions.<리전>`에는 `outcome`(`completed`/`gave_up_failed`/`gave_up_wait`/`error`), `*_by_type`, `failed_items`, `listing_failed_by_type`(타입별 `count`, 대표 에러, `bucket`), `listing_failed_buckets`(버킷별 타입 목록), `listing_failed_by_bucket`(버킷별 타입 수), `listing_failed_unexpected`(LIST-ERR에 들어간 타입), `log`, `config`가 들어 있다.
 
 ## 알려진 한계
 
-- **"listing failed"는 남는다.** aws-nuke는 엔드포인트가 아예 없는 서비스만 조용히 건너뛰고, 그 밖의 lister 에러는 모두 ERROR로 남긴다. 구독하지 않은 Q Business, 권한이나 스로틀링 오류 같은 에러는 제외하지 않았으므로 계속 보인다. 이 모듈은 이것을 "예상됨"과 "예상 밖"으로 나눠 보여 줄 뿐이다.
+- **"listing failed"는 남는다.** aws-nuke는 엔드포인트가 아예 없는 서비스만 조용히 건너뛰고, 그 밖의 lister 에러는 모두 ERROR로 남긴다. 구독하지 않은 Q Business, 리전에 따라 안 되는 서비스(다른 리전에서는 돈이 든다), 권한이나 스로틀링 오류 같은 에러는 제외하지 않았으므로 계속 보인다. 이 모듈은 이것을 네 갈래(예상됨 / SCP 의심 / 5xx·스로틀링 / 예상 밖)로 나눠 보여 줄 뿐이다. 분류는 에러 문구 기준이라 AWS가 문구를 바꾸면 "예상 밖"으로 떨어진다(안전한 쪽).
 - **조용한 누락**: lister가 실패한 타입, 설정 밖 리전, aws-nuke가 지원하지 않는 리소스(예: Bedrock imported model)는 종료 코드 0이어도 남을 수 있다. 완료 판정은 `verify/`(D+2 비용 확인)로 한다.
 - 실패한 항목만 남으면 aws-nuke(libnuke v1.3.0)는 2~3패스 만에 포기한다. CloudFront 배포처럼 비활성화 전파가 필요한 리소스는 **두 번째 실행**이 필요할 수 있다.
 - CloudFormation 스택 삭제는 aws-nuke 안에서 여전히 블로킹이다(최대 60분). 스택은 `cfn_predelete`로 먼저 지운다.
@@ -447,5 +542,5 @@ AWS_NUKE_BIN=~/.cache/edu-cleanup/bin/aws-nuke python3 -m pytest nuke/tests -q
 ```
 
 - `test_nuke_make_config.py`: YAML 구조, 제외·필터·설정 이름이 `aws-nuke/docs/resources`에 있는지(와일드카드 전개 포함), 학생이 쓸 수 있는 서비스를 제외하지 않는지 확인한다. 실제 바이너리의 `explain-config --account-id`(자격 증명 불필요)로 설정이 파싱되는지도 본다.
-- `test_nuke_summary.py`: 실제 v3.68.3 바이너리를 moto 서버에 돌려 얻은 JSON 로그(`tests/fixtures/real-*.jsonl`)와 합성 로그로 jq 요약과 상태 판정을 확인한다.
-- `test_nuke_shell.py`: shellcheck, 가짜 `aws`/`aws-nuke`로 `run_nuke.sh`를 끝까지 실행한다(리전 병렬 후 global, 별칭, 보호, 종료 코드). CloudShell 블록이 만드는 설정이 `make_config.py`와 같은지 비교한다. 대화형 bash(pty)에 블록을 붙여 넣어 dry-run → yes → apply → 기본 VPC까지 확인한다.
+- `test_nuke_summary.py`: 실제 v3.68.3 바이너리를 moto 서버에 돌려 얻은 JSON 로그(`tests/fixtures/real-*.jsonl`)와 합성 로그로 jq 요약과 상태 판정을 확인한다. `real-cloudshell-v3.68.3-listing-failed.jsonl`은 실제 CloudShell 17개 리전 dry-run(2026-10-15)의 LISTING FAILED 줄을 에러 문구 그대로 JSON 로그 형식으로 되돌린 것으로, 버킷 분류·한 줄 요약·LIST-ERR를 확인한다.
+- `test_nuke_shell.py`: shellcheck, 가짜 `aws`/`aws-nuke`로 `run_nuke.sh`를 끝까지 실행한다(리전 병렬 후 global, 별칭, 보호, 종료 코드). CloudShell 블록이 만드는 설정이 `make_config.py`와 같은지, 블록에 든 분류 규칙·jq 코드가 `listing_errors.json`·`summarize.jq`와 같은지 비교한다. 대화형 bash(pty)에 블록을 붙여 넣어 dry-run → yes → apply → 기본 VPC까지 확인한다.

@@ -5,6 +5,11 @@ def pad($n): tostring | if length >= $n then .[0:$n] else . + ([range($n - lengt
 def lpad($n): tostring | if length >= $n then . else ([range($n - length)] | map(" ") | join("")) + . end;
 def dash: if . == null or . == 0 then "-" else tostring end;
 def bytype: to_entries | sort_by(-.value, .key) | map("\(.key) \(.value)") | join(", ");
+# LIST-ERR = lister failures that may hide resources (unexpected + transient); EXP/SCP = expected / maybe-SCP types
+def lferr: (.listing_failed_unexpected // []) | length;
+def expscp: (.listing_failed_by_bucket // {}) as $b | [($b.expected // 0), ($b.maybe_scp // 0)]
+            | if add == 0 then "-" else "\(.[0])/\(.[1])" end;
+def bucket($b): (.listing_failed_buckets // {})[$b] // [];
 
 . as $r
 | ($r.applied) as $apply
@@ -14,13 +19,13 @@ def bytype: to_entries | sort_by(-.value, .key) | map("\(.key) \(.value)") | joi
     ("REGION" | pad(16)) + ("EXIT" | pad(6)) + ("TIME" | pad(7))
       + (if $apply then ("REMOVED" | lpad(8)) + ("FAILED" | lpad(8)) + ("LEFT" | lpad(6))
          else ("WOULD-DELETE" | lpad(13)) end)
-      + ("KEPT" | lpad(6)) + ("LIST-ERR" | lpad(10)),
+      + ("KEPT" | lpad(6)) + ("LIST-ERR" | lpad(10)) + ("EXP/SCP" | lpad(9)),
     ( $r.regions | to_entries[] | .key as $o | .value as $v
       | ($o | pad(16)) + ($v.exit_code | tostring | pad(6)) + ("\($v.duration_s // 0)s" | pad(7))
         + (if $apply then ($v.counts.removed | dash | lpad(8)) + ($v.counts.failed | dash | lpad(8))
                           + ($v.counts.remaining | dash | lpad(6))
            else ($v.counts.would_remove | dash | lpad(13)) end)
-        + ($v.counts.filtered | dash | lpad(6)) + ($v.counts.listing_failed | dash | lpad(10)) ),
+        + ($v.counts.filtered | dash | lpad(6)) + ($v | lferr | dash | lpad(10)) + ($v | expscp | lpad(9)) ),
     "",
     ( $r.regions | to_entries[] | .key as $o | .value as $v
       | ( if $apply then
@@ -31,10 +36,13 @@ def bytype: to_entries | sort_by(-.value, .key) | map("\(.key) \(.value)") | joi
           else
             (if ($v.would_remove_by_type | length) > 0 then "[\($o)] would delete: \($v.would_remove_by_type | bytype)" else empty end)
           end ),
-        ( ($v.listing_failed_by_type // {}) | to_entries
-          | map(select(.key as $k | ($v.listing_failed_unexpected // []) | index($k) | not)) | map(.key)
+        ( $v | bucket("expected")
           | if length > 0 then "[\($o)] listing failed (expected - service not used/subscribed): \(join(", "))" else empty end ),
-        ( ($v.listing_failed_unexpected // [])[] as $k
+        ( $v | bucket("maybe_scp")
+          | if length > 0 then "[\($o)] access denied (maybe SCP): \(join(", "))" else empty end ),
+        ( $v | bucket("transient")
+          | if length > 0 then "[\($o)] LISTING FAILED (5xx/throttling - re-run to confirm): \(join(", "))" else empty end ),
+        ( $v | bucket("unexpected")[] as $k
           | "[\($o)] LISTING FAILED \($k): \($v.listing_failed_by_type[$k].error)" ),
         ( ($v.fatal // [])[] | "[\($o)] aws-nuke stopped: \(.)" ),
         ( if ($v.non_json_lines // 0) > 0 and ($v.exit_code != 0) then "[\($o)] aws-nuke crashed - see \($v.log) / .stderr" else empty end )
@@ -45,6 +53,8 @@ def bytype: to_entries | sort_by(-.value, .key) | map("\(.key) \(.value)") | joi
       else
         "RESULT: \($r.status) (exit \($r.exit_code))  would delete \($r.totals.would_remove) item(s) - nothing was changed"
       end ),
+    ( ($r.totals.listing_failed_unexpected // 0) as $n
+      | if $n > 0 then "LIST-ERR: \($n) lister failure(s) - resources of those types were NOT scanned (see LISTING FAILED above)" else empty end ),
     ( if ($r.protected_users // [] | length) > 0 then "protected IAM user(s): \($r.protected_users | join(", "))" else empty end ),
     "logs + configs: \($r.log_dir)"
   ]

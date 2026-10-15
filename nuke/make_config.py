@@ -44,7 +44,8 @@ EXCLUDE_GROUPS: List[Tuple[str, List[Tuple[str, str]]]] = [
          "lister reads ONE Scan page and only the partition key (resources/dynamodb-item.go): DeleteItem fails on "
          "tables with a sort key and every pass re-scans; DeleteTable removes all items anyway"),
     ]),
-    ("Services AWS has shut down (endpoint gone -> DNS error or ~30 s timeout per call, aws-nuke#1013)", [
+    ("Services / APIs AWS has shut down (endpoint gone, disabled or 503 -> lister error or ~30 s timeout per call, "
+     "aws-nuke#1013)", [
         ("OpsWorks*", "OpsWorks Stacks / Chef Automate / Puppet Enterprise: full shutdown 2024-05-01 (7 types)"),
         ("CodeStarProject",
          "AWS CodeStar: full shutdown 2024-07-25. NOT CodeStar*: CodeStarConnection (CodeConnections) and "
@@ -56,12 +57,28 @@ EXCLUDE_GROUPS: List[Tuple[str, List[Tuple[str, str]]]] = [
         ("InspectorAssessment*",
          "Amazon Inspector Classic: full shutdown 2026-05-20 (Run, Target, Template). NOT Inspector2 (billed)"),
         ("AppMesh*", "AWS App Mesh: discontinued 2026-09-30 (7 types)"),
+        # Lex V1 = the lexmodelbuildingservice API (resources/lex-*.go). Exact names, not Lex*: a future Lex V2
+        # resource type must stay in scope. Checked 2026-10-15 (docs.aws.amazon.com/lex/latest/dg/what-is.html).
+        ("LexBot", "Amazon Lex V1: end of support 2025-09-15 (V1 console + resources no longer accessible); "
+                   "real dry-run 2026-10-15: HTTP 503 in every region. Lex V2 is not affected"),
+        ("LexIntent", "Amazon Lex V1: end of support 2025-09-15; HTTP 503 in every region (2026-10-15)"),
+        ("LexSlotType", "Amazon Lex V1: end of support 2025-09-15; HTTP 503 in every region (2026-10-15)"),
+        ("LexModelBuildingServiceBotAlias",
+         "Amazon Lex V1 bot aliases: end of support 2025-09-15; HTTP 503 in every region (2026-10-15)"),
+        ("GlueDevEndpoint",
+         "AWS Glue dev endpoints only run Glue 0.9/1.0, end of life 2026-04-01 (glue-version-support-policy); "
+         "real dry-run 2026-10-15: GetDevEndpoints 'operation is currently disabled' in all 17 regions. "
+         "Every other Glue type (GlueJob, GlueSession ...) stays in scope"),
     ]),
     ("Closed to new customers - a newly created student account cannot create these", [
         ("Cloud9Environment", "AWS Cloud9: closed to new customers 2024-07-25"),
         ("CloudSearchDomain", "Amazon CloudSearch: closed to new customers 2024-07-25"),
         ("DataPipelinePipeline", "AWS Data Pipeline: no longer available to new customers"),
         ("MachineLearning*", "Amazon Machine Learning: not accepting new users (4 types)"),
+        ("CloudDirectoryDirectory",
+         "Amazon Cloud Directory: no longer open to new customers, end of support 2027-07-24 (checked 2026-10-15); "
+         "real dry-run 2026-10-15: 'Account ... is not authorized for region' in every region"),
+        ("CloudDirectorySchema", "Amazon Cloud Directory: closed to new customers (see CloudDirectoryDirectory)"),
         ("AWS::Timestream::*",
          "Timestream for LiveAnalytics: closed to new customers 2025-06-20 (Cloud Control types Database, Table, "
          "ScheduledQuery registered by default). NOT TimestreamInfluxDBDbInstance (open and billed)"),
@@ -79,9 +96,11 @@ EXCLUDE_GROUPS: List[Tuple[str, List[Tuple[str, str]]]] = [
 ]
 
 # Types that must stay in scope (students can create them and they cost money). Tests assert
-# that no default exclude pattern matches any of these.
+# that no default exclude pattern matches any of these. Region-gated listers (Bedrock customization,
+# Verified Access, DocDB in us-west-1, Rekognition/Textract/Timestream InfluxDB AccessDenied ...) are NOT
+# excluded: they are classified as expected / maybe-SCP in the summary instead (listing_errors.json).
 MUST_KEEP_EXAMPLES = (
-    "QBusinessApplication", "QBusinessIndex", "GlueJob", "GlueDevEndpoint", "GlueDataBrewJobs", "Inspector2",
+    "QBusinessApplication", "QBusinessIndex", "GlueJob", "GlueSession", "GlueDataBrewJobs", "Inspector2",
     "TimestreamInfluxDBDbInstance", "RedshiftServerlessWorkgroup", "RedshiftServerlessNamespace",
     "CodeStarConnection", "CodeStarNotificationRule", "KinesisAnalyticsApplication", "BedrockAgent",
     "OSCollection", "SageMakerEndpoint", "EC2Instance", "CloudFormationStack", "DynamoDBTable", "S3Bucket",

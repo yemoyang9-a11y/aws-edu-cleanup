@@ -7,7 +7,7 @@ import sys
 import pytest
 import yaml
 
-from nuke_test_support import NUKE_DIR
+from nuke_test_support import DOCS_RESOURCES, NUKE_DIR
 
 import make_config as mc
 
@@ -117,8 +117,36 @@ def test_excludes_cover_the_noisy_services(resource_docs):
     for t in ["S3Object", "DynamoDBTableItem", "FMSPolicy", "FMSNotificationChannel", "ShieldProtection",
               "ShieldProtectionGroup", "OpsWorksApp", "OpsWorksCMServer", "Cloud9Environment", "CodeStarProject",
               "MachineLearningMLModel", "CloudSearchDomain", "AWS::Timestream::Database", "AWS::Timestream::Table",
-              "AWS::Timestream::ScheduledQuery"]:
+              "AWS::Timestream::ScheduledQuery", *RETIRED_2026_10]:
         assert t in excluded, t
+
+
+# Added after the real 17-region CloudShell dry-run of 2026-10-15: listers that failed in EVERY region because
+# the service/API is retired (not region gating). Exact names - each must be a registered v3.68.3 type.
+RETIRED_2026_10 = ["LexBot", "LexIntent", "LexSlotType", "LexModelBuildingServiceBotAlias",
+                   "CloudDirectoryDirectory", "CloudDirectorySchema", "GlueDevEndpoint"]
+
+
+def test_retired_2026_10_excludes_exist_and_are_exact(resource_docs):
+    for t in RETIRED_2026_10:
+        assert t in resource_docs, f"{t} is not an aws-nuke v3.68.3 resource type"
+        assert t in mc.default_excludes(), t                 # exact name, no wildcard
+    # Lex: only the V1 (lexmodelbuildingservice) types exist in v3.68.3 - all four excluded, nothing else
+    assert sorted(n for n in resource_docs if n.startswith("Lex")) == sorted(RETIRED_2026_10[:4])
+    src = DOCS_RESOURCES.parent.parent / "resources"
+    for f in src.glob("lex-*.go"):
+        assert "service/lexmodelbuildingservice" in f.read_text(), f.name   # Lex V1 API, not lexmodelsv2
+
+
+def test_region_gated_types_are_not_excluded(resource_docs):
+    """Listers that fail only in SOME regions (or with a bare AccessDenied) stay in scope - students can use them
+    elsewhere and they bill. The summary classifies those errors instead (listing_errors.json)."""
+    excluded = {n for p in mc.default_excludes() for n in expand(p, list(resource_docs))}
+    for t in ("BedrockCustomModel", "BedrockModelCustomizationJob", "BedrockEvaluationJob", "BedrockPrompt",
+              "BedrockFlowAlias", "EC2VerifiedAccessInstance", "DocDBCluster", "ComprehendDocumentClassifier",
+              "TranscribeLanguageModel", "RekognitionProject", "RekognitionDataset", "TextractAdapter",
+              "TimestreamInfluxDBDbInstance", "SSMQuickSetupConfigurationManager"):
+        assert t in resource_docs and t not in excluded, t
 
 
 def test_never_excludes_services_students_can_still_buy(resource_docs):
@@ -127,9 +155,11 @@ def test_never_excludes_services_students_can_still_buy(resource_docs):
     for t in mc.MUST_KEEP_EXAMPLES:
         if t in names:   # (OSCollection has no docs page in v3.68.3 but is registered)
             assert t not in excluded, f"{t} must stay deletable"
+    retired = {"GlueDevEndpoint"}   # Glue 0.9/1.0 only (EOL 2026-04-01), API disabled - see make_config.py
     for family in ("QBusiness", "Glue", "Bedrock", "SageMaker", "EC2", "RDS", "Lambda", "OS", "ES", "Kinesis"):
         fam = [n for n in names if n.startswith(family)]
-        assert fam and not (set(fam) & excluded), family
+        assert fam and not ((set(fam) - retired) & excluded), family
+    assert excluded & {n for n in names if n.startswith("Glue")} == retired
 
 
 def test_each_exclude_has_a_justification():
@@ -242,6 +272,8 @@ def test_real_aws_nuke_parses_config(aws_nuke_bin, tmp_path):
     assert p.returncode == 0, p.stdout + p.stderr
     excluded = [ln.strip() for ln in p.stdout.split("Excluded Resource Types:")[1].splitlines() if ln.startswith("  ")]
     assert "S3Object" in excluded and "DynamoDBTableItem" in excluded and "AWS::Timestream::Table" in excluded
-    assert not [x for x in excluded if x.startswith(("QBusiness", "Glue", "CodeStarConnection", "Inspector2"))]
+    assert set(RETIRED_2026_10) <= set(excluded)
+    assert not [x for x in excluded if x.startswith(("QBusiness", "Glue", "CodeStarConnection", "Inspector2"))
+                and x != "GlueDevEndpoint"]
     m = [ln for ln in p.stdout.splitlines() if ln.strip().startswith("Excluded:")][0]
-    assert int(m.split()[-1]) == len(excluded) == 44
+    assert int(m.split()[-1]) == len(excluded) == 51
