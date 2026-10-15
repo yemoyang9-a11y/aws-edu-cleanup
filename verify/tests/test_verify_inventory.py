@@ -83,13 +83,16 @@ def test_verify_inventory_counts_and_access_denied_region(aws):
     assert inv.protected["us-east-1"]["s3_buckets"] == ["edu-bootstrap-artifacts"]
     assert "student-db" in inv.items["ap-northeast-2"]["rds_instances"]
 
-    # the denied region is "could not check" for every type, never a crash, never a count
-    denied = inv.unchecked[DENIED_REGION]
+    # the denied region is "blocked by policy" for every type (or n/a where the service does not exist),
+    # never a crash, never a count, never an inventory error
+    denied = inv.blocked[DENIED_REGION]
     assert denied["ec2_instances"] == "AccessDeniedException"
     assert denied["dynamodb_tables"] == "AccessDeniedException"
-    assert len(denied) == len(vc.REGIONAL_CHECKS)
+    assert len(denied) + len(inv.not_applicable.get(DENIED_REGION, {})) == len(vc.REGIONAL_CHECKS)
+    assert DENIED_REGION not in inv.unchecked
     assert DENIED_REGION not in inv.counts or sum(inv.counts[DENIED_REGION].values()) == 0
-    assert any(e["region"] == DENIED_REGION and e["code"] == "AccessDeniedException" for e in inv.errors)
+    assert not any(e["region"] == DENIED_REGION for e in inv.errors)
+    assert inv.blocked_count() == len(denied)
 
 
 def test_verify_inventory_empty_account_counts_zero(aws):
@@ -159,7 +162,8 @@ def test_verify_inventory_clean_account_and_unchecked_region_stays_clean(aws, mo
     res = json.loads(out.read_text(encoding="utf-8"))
     assert code == 0 and res["status"] == "CLEAN"
     assert res["inventory_complete"] is False
-    assert res["inventory_unchecked"][DENIED_REGION]["ec2_instances"] == "AccessDeniedException"
+    assert res["blocked_by_policy"][DENIED_REGION]["ec2_instances"] == "AccessDeniedException"
+    assert res["blocked_by_policy_count"] >= 1 and DENIED_REGION not in res["inventory_unchecked"]
 
 
 def test_verify_all_regions_uses_account_list_regions_paginated(monkeypatch):

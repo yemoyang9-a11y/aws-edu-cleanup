@@ -142,8 +142,8 @@ def test_verify_pending_by_date_but_cost_already_visible_is_residual(ce_stub, tm
 
 
 def test_verify_pending_no_ce_call_when_window_empty(ce_stub, tmp_path):
-    # same UTC day as cleanup: nothing to query, no CE request (no $0.01 spent)
-    code, res = run(tmp_path, now="2026-10-10T20:00")
+    # same UTC day as cleanup: nothing to query, no CE request (no $0.01 spent) in cost mode
+    code, res = run(tmp_path, "--mode", "cost", now="2026-10-10T20:00")
     ce_stub.assert_no_pending_responses()
     assert code == 3 and res["status"] == "PENDING"
     assert res["ce_requests"] == 0 and res["window"]["end"] is None
@@ -273,9 +273,10 @@ def test_verify_days_limits_window(ce_stub, tmp_path):
      "ce:GetCostAndUsage"),
 ])
 def test_verify_ce_errors_exit_2_with_korean_hint(ce_stub, tmp_path, capsys, code, message, needle):
+    # --mode cost keeps the strict behaviour (auto would fall back to the inventory, see test_verify_modes.py)
     ce_stub.add_client_error("get_cost_and_usage", service_error_code=code, service_message=message,
                              http_status_code=400, expected_params=_expected())
-    rc, res = run(tmp_path)
+    rc, res = run(tmp_path, "--mode", "cost")
     assert rc == vc.EXIT_ERROR == 2
     assert res["status"] == "ERROR"
     err = [e for e in res["errors"] if e["stage"] == "cost"][0]

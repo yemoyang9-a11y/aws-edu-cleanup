@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""D+2 cost verification for one AWS training account (edu-cleanup module 7: verify).
+"""Post-cleanup verification for one AWS training account (edu-cleanup module 7: verify).
 
-"Clean" means: from the day after cleanup up to yesterday (UTC), Cost Explorer shows
-no *usage* cost line (service x usage type x day) above the threshold that is not
-covered by an allowlist rule. Optionally also runs a cheap read-only inventory of
-commonly billable leftovers. Read-only: --apply is accepted but nothing is changed.
+Two ways to judge "clean" (--mode):
 
-Exit codes: 0 CLEAN, 1 RESIDUAL, 2 ERROR, 3 PENDING (too early to judge).
+* cost      - from the day after cleanup up to yesterday (UTC), Cost Explorer shows no *usage*
+              cost line (service x usage type x day) above the threshold that is not covered by an
+              allowlist rule (D+2 check). Optionally also runs the inventory (--inventory).
+* inventory - never calls Cost Explorer. A live, read-only inventory of ~75 commonly creatable or
+              billable resource types (per region + global) finds nothing outside the protected
+              names. Runs immediately after cleanup (no settle-day wait). This is the path for member
+              accounts of a reseller's AWS Organization whose SCPs deny ce:* even to root.
+* auto      - (default) try Cost Explorer; if it is denied / not enabled / has no data, fall back to
+              inventory mode with a note instead of failing.
+
+Read-only: --apply is accepted but nothing is changed.
+Exit codes: 0 CLEAN, 1 RESIDUAL, 2 ERROR, 3 PENDING (too early to judge; cost mode only).
 """
 import sys
 from pathlib import Path
@@ -17,15 +25,20 @@ import argparse
 import datetime as dt
 import fnmatch
 import json
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 from botocore.exceptions import BotoCoreError, ClientError
 
-from common.session import now_iso
+from common.session import now_iso, caller_arn, ROLE_NAME
 
 MODULE = "verify"
+
+MODE_AUTO = "auto"
+MODE_COST = "cost"
+MODE_INVENTORY = "inventory"
 
 # Cost Explorer facts (verified against the botocore `ce` service model 1.43.x):
 #   - endpoint lives in us-east-1
@@ -63,9 +76,18 @@ BUILTIN_ALLOWLIST = [{
     "builtin": True,
 }]
 
-# Resources whose identifier starts with these belong to the protected bootstrap (CONTRACTS.md):
-# they are listed under inventory_protected and never make the verdict RESIDUAL.
-PROTECTED_PREFIXES = ("edu-bootstrap", "EduCleanup")
+# Resources whose name (or any '/'- or ':'-separated part of their identifier, e.g. the function name
+# inside /aws/lambda/<fn> or the topic name inside an SNS ARN) starts with one of these are listed
+# under inventory_protected and never make the verdict RESIDUAL. CloudFormation stacks whose name is
+# protected also protect every physical resource they own (list_stack_resources).
+#   - edu-bootstrap*, EduCleanup*  : the bootstrap stack / EduCleanupRole (CONTRACTS.md)
+#   - edu-killswitch*              : kill switch stacks and their resources (allowed to remain)
+#   - the rest                     : created by the reseller's AWS Organization in member accounts
+#                                    (Organizations access role, StackSets, Control Tower)
+EDU_PROTECTED_PREFIXES = ("edu-bootstrap", "EduCleanup", "edu-killswitch")
+ORG_MANAGED_PREFIXES = ("OrganizationAccountAccessRole", "StackSet-", "stacksets-exec-",
+                        "AWSCloudFormationStackSetExecutionRole", "aws-controltower", "AWSControlTower")
+PROTECTED_PREFIXES = EDU_PROTECTED_PREFIXES + ORG_MANAGED_PREFIXES
 
 # A day Cost Explorer has not returned at all is "not posted yet" for this long after it ended;
 # afterwards a missing day is treated as $0 (CE may omit empty days) so the run can finish.
@@ -79,6 +101,8 @@ HINT_CE_DATA_UNAVAILABLE = ("Cost Explorer 데이터가 아직 없습니다. 콘
 HINT_CE_ACCESS = ("ce:GetCostAndUsage 권한이 없습니다. EduCleanupRole(--role-arn) 또는 ce:GetCostAndUsage가 있는 "
                   "IAM 사용자로 실행하세요. 권한이 있는데도 거부되면 콘솔에서 Cost Explorer를 한 번 열어 활성화하세요.")
 HINT_CREDENTIALS = "AWS 자격 증명을 확인하세요 (--profile / --role-arn / --external-id)."
+HINT_CE_FALLBACK = ("Cost Explorer를 쓸 수 없어 인벤토리 모드로 판정했습니다 (리셀러 조직의 SCP가 ce:*를 막는 멤버 계정이면 정상). "
+                    "이런 계정은 처음부터 --mode inventory 로 실행하세요. 비용 확정은 리셀러 청구서로만 할 수 있습니다.")
 
 # Best-effort mapping of usage-type prefixes to regions (no prefix = us-east-1 or a global service).
 USAGE_TYPE_REGION_PREFIX = {
@@ -112,7 +136,9 @@ SERVICE_HINTS = {
 
 
 # --------------------------------------------------------------------------- args
-def _date(value: str) -> dt.date:
+def _date(value: str) -> Optional[dt.date]:
+    if not value.strip():
+        return None  # the hub passes --cleanup-date "" when it has none
     try:
         return dt.date.fromisoformat(value)
     except ValueError:
@@ -142,11 +168,16 @@ def _nonneg_float(value: str) -> float:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="D+2 Cost Explorer 검증: 정리 다음 날부터 어제(UTC)까지 허용 목록 밖 사용 요금이 없으면 CLEAN.")
+        description="정리 후 검증. inventory: 남은 리소스가 없으면 CLEAN (Cost Explorer 미사용, 정리 직후 실행). "
+                    "cost: 정리 다음 날부터 어제(UTC)까지 허용 목록 밖 사용 요금이 없으면 CLEAN (D+2). "
+                    "auto(기본): cost를 시도하고 Cost Explorer가 막혀 있으면 inventory로 판정.")
     add_common_args(p)
+    p.add_argument("--mode", choices=(MODE_AUTO, MODE_COST, MODE_INVENTORY), default=MODE_AUTO,
+                   help="inventory = Cost Explorer를 절대 호출하지 않음 / cost = Cost Explorer로만 판정 / "
+                        "auto = Cost Explorer 거부·미활성화·데이터 없음이면 inventory로 대체 (기본: %(default)s)")
     p.add_argument("--cleanup-date", type=_date, default=None,
-                   help="정리(aws-nuke)가 끝난 날짜 YYYY-MM-DD (기본: 오늘, Asia/Seoul). "
-                        "KST/UTC 어느 쪽 날짜로 적어도 검사 구간은 다음 날(UTC)부터 시작한다.")
+                   help="정리(aws-nuke)가 끝난 날짜 YYYY-MM-DD (cost/auto 기본: 오늘, Asia/Seoul; inventory 모드에서는 "
+                        "기록용·선택). KST/UTC 어느 쪽 날짜로 적어도 검사 구간은 다음 날(UTC)부터 시작한다.")
     p.add_argument("--settle-days", type=_nonneg_int, default=2,
                    help="정리일 + N일(UTC 00:00) 전에는 PENDING (기본: 2)")
     p.add_argument("--lag-hours", type=_nonneg_float, default=12.0,
@@ -166,12 +197,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="마지막 날짜가 Estimated=false(확정)가 아니면 PENDING. Estimated는 보통 월 마감까지 true라서 "
                         "월초에 지난달을 최종 확인할 때만 쓴다.")
     p.add_argument("--inventory", action="store_true",
-                   help="과금 잔여물 빠른 인벤토리도 실행 (읽기 전용)")
+                   help="cost 모드에서도 잔여물 인벤토리를 함께 실행 (inventory 모드와 auto 대체 시에는 항상 실행)")
     p.add_argument("--all-regions", action="store_true",
-                   help="인벤토리를 활성화된 모든 리전에서 실행 (account:ListRegions)")
+                   help="인벤토리를 활성화된 모든 리전에서 실행 (account:ListRegions, 실패 시 ec2:DescribeRegions)")
     p.add_argument("--protect-prefix", action="append", default=[],
                    help="이 접두사로 시작하는 리소스 이름은 인벤토리 잔여물로 세지 않음 (반복 가능, "
                         "기본 내장: %s)" % ", ".join(PROTECTED_PREFIXES))
+    p.add_argument("--max-examples", type=_nonneg_int, default=5,
+                   help="요약/JSON examples 에 유형별로 보여 줄 리소스 ID 수 (기본: %(default)s)")
     p.add_argument("--now", type=_utc_datetime, default=None,
                    help="(재현/테스트용) 현재 시각을 UTC로 고정: YYYY-MM-DD 또는 YYYY-MM-DDTHH:MM")
     return p
@@ -404,6 +437,38 @@ def classify_ce_error(e: Exception) -> Dict[str, Any]:
             "hint": HINT_CREDENTIALS if "credential" in str(e).lower() else ""}
 
 
+CE_FALLBACK_CODES = {"AccessDeniedException", "AccessDenied", "UnauthorizedOperation", "UnauthorizedException",
+                     "DataUnavailableException"}
+
+
+def ce_fallback_reason(e: Exception) -> Optional[str]:
+    """auto mode: return why Cost Explorer is unusable for this account (-> inventory), or None.
+
+    Covers SCP explicit denies (reseller member accounts), plain AccessDenied, Cost Explorer never
+    enabled, and DataUnavailable. Credential, throttling and other errors stay errors (exit 2).
+    """
+    if not isinstance(e, ClientError):
+        return None
+    code = e.response.get("Error", {}).get("Code", "")
+    low = str(e.response.get("Error", {}).get("Message", "")).lower()
+    if "service control policy" in low or "explicit deny" in low:
+        return "scp-deny"
+    if "not enabled" in low or "not activated" in low:
+        return "not-enabled"
+    if code == "DataUnavailableException":
+        return "data-unavailable"
+    if code in CE_FALLBACK_CODES or "accessdenied" in code.lower():
+        return "access-denied"
+    return None
+
+
+def probe_cost_explorer(ce, today: dt.date) -> int:
+    """One cheap request (yesterday, no grouping) just to learn whether CE is usable. Returns requests."""
+    ce.get_cost_and_usage(TimePeriod={"Start": (today - dt.timedelta(days=1)).isoformat(), "End": today.isoformat()},
+                          Granularity="DAILY", Metrics=[CE_METRIC])
+    return 1
+
+
 # --------------------------------------------------------------------------- inventory
 _client_lock = threading.Lock()
 
@@ -422,66 +487,373 @@ def _items(c, op: str, key: str, **kwargs):
         return
     call = getattr(c, op)
     params = dict(kwargs)
+    seen = set()
     while True:
         resp = call(**params)
         for item in resp.get(key, []) or []:
             yield item
         token = resp.get("nextToken") or resp.get("NextToken")
-        if not token:
+        if not token or token in seen:
             return
+        seen.add(token)
         params["nextToken" if "nextToken" in resp else "NextToken"] = token
 
 
-def _ec2_instances(c):
+def _get(item: Any, path: Optional[str]) -> Any:
+    if path is None:
+        return item
+    cur = item
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+# States after which a resource is gone (still listed for a while by some APIs).
+GONE_STATES = {"deleted", "terminated", "deregistered", "delete_complete"}
+
+
+def _gone(state: Any) -> bool:
+    return isinstance(state, str) and state.lower() in GONE_STATES
+
+
+def _is_deleting(state: Any) -> bool:
+    """Transient 'going away' states: still listed as residual, but flagged so the operator re-runs."""
+    if not isinstance(state, str):
+        return False
+    s = state.lower()
+    if "fail" in s or "unsuccess" in s:
+        return False
+    return "delet" in s or "terminat" in s or s == "shutting-down"
+
+
+def _list(op: str, key: str, ident: Any = None, state: Optional[str] = None,
+          skip: Any = None, **kwargs):
+    """Declarative check: list `op`, take `ident` (field name or callable) of every item in `key`.
+
+    Items whose `state` is gone (deleted/terminated/...) or for which skip(item) is true are ignored.
+    Returns a check function(client, inventory) -> list of ids or (id, state) tuples.
+    """
+    def fn(c, inv=None):
+        out = []
+        for it in _items(c, op, key, **kwargs):
+            st = _get(it, state) if state else None
+            if _gone(st) or (skip is not None and skip(it)):
+                continue
+            ident_val = ident(it) if callable(ident) else _get(it, ident)
+            if ident_val is None:
+                continue
+            out.append((str(ident_val), st) if st else str(ident_val))
+        return out
+    fn.spec = {"op": op, "key": key, "kwargs": kwargs,
+               "fields": [f.split(".")[0] for f in (ident, state) if isinstance(f, str)]}
+    fn.ops = [op]
+    return fn
+
+
+def _uses(*ops):
+    """Decorator: declare the client operations a custom check calls (checked against botocore in tests)."""
+    def deco(fn):
+        fn.ops = list(ops)
+        return fn
+    return deco
+
+
+@_uses("describe_instances")
+def _ec2_instances(c, inv=None):
     live = ["pending", "running", "shutting-down", "stopping", "stopped"]
     out = []
     for page in c.get_paginator("describe_instances").paginate(
             Filters=[{"Name": "instance-state-name", "Values": live}]):
         for res in page.get("Reservations", []):
-            out.extend(i["InstanceId"] for i in res.get("Instances", []))
+            out.extend((i["InstanceId"], _get(i, "State.Name")) for i in res.get("Instances", []))
     return out
 
 
-# (inventory type, boto3 service, function(client) -> list of identifiers)
+def _default_vpc_ids(c) -> set:
+    return {v["VpcId"] for v in _items(c, "describe_vpcs", "Vpcs",
+                                       Filters=[{"Name": "is-default", "Values": ["true"]}])}
+
+
+@_uses("describe_vpcs", "describe_internet_gateways")
+def _internet_gateways(c, inv=None):
+    """IGWs except the one attached to the default VPC (detached IGWs count)."""
+    default = _default_vpc_ids(c)
+    out = []
+    for g in _items(c, "describe_internet_gateways", "InternetGateways"):
+        attached = [a.get("VpcId") for a in g.get("Attachments", []) or [] if a.get("VpcId")]
+        if attached and all(v in default for v in attached):
+            continue
+        out.append(g["InternetGatewayId"])
+    return out
+
+
+@_uses("describe_addresses")
+def _elastic_ips(c, inv=None):
+    return [a.get("AllocationId") or a.get("PublicIp") for a in c.describe_addresses().get("Addresses", [])]
+
+
+@_uses("describe_vpn_connections")
+def _vpn_connections(c, inv=None):
+    return [(v["VpnConnectionId"], v.get("State")) for v in c.describe_vpn_connections().get("VpnConnections", [])
+            if not _gone(v.get("State"))]
+
+
+@_uses("list_clusters", "list_services")
+def _ecs_services(c, inv=None):
+    out = []
+    for arn in _items(c, "list_clusters", "clusterArns"):
+        cluster = arn.rsplit("/", 1)[-1]
+        for svc in _items(c, "list_services", "serviceArns", cluster=arn):
+            out.append("%s/%s" % (cluster, svc.rsplit("/", 1)[-1]))
+    return out
+
+
+@_uses("list_delivery_streams")
+def _firehose_streams(c, inv=None):
+    out: List[str] = []
+    params: Dict[str, Any] = {}
+    while True:
+        resp = c.list_delivery_streams(**params)
+        names = resp.get("DeliveryStreamNames", []) or []
+        out.extend(names)
+        if not resp.get("HasMoreDeliveryStreams") or not names:
+            return out
+        params["ExclusiveStartDeliveryStreamName"] = names[-1]
+
+
+@_uses("list_keys", "describe_key")
+def _kms_keys(c, inv=None):
+    """Customer-managed keys that are not already scheduled for deletion."""
+    out = []
+    for k in _items(c, "list_keys", "Keys"):
+        try:
+            md = c.describe_key(KeyId=k["KeyId"])["KeyMetadata"]
+        except ClientError as e:  # unreadable key: not provably AWS-managed -> report it
+            out.append((k["KeyId"], "describe-failed:%s" % _err(e)[0]))
+            continue
+        if md.get("KeyManager") != "CUSTOMER" or md.get("KeyState") in ("PendingDeletion", "PendingReplicaDeletion"):
+            continue
+        out.append(md["KeyId"])
+    return out
+
+
+@_uses("describe_alarms")
+def _cloudwatch_alarms(c, inv=None):
+    out = []
+    types = ["MetricAlarm", "CompositeAlarm", "LogAlarm"]
+    for page in c.get_paginator("describe_alarms").paginate(AlarmTypes=types):
+        for key in ("MetricAlarms", "CompositeAlarms", "LogAlarms"):
+            out.extend(a["AlarmName"] for a in page.get(key, []) or [])
+    return out
+
+
+# Log groups created by the reseller's Organization / Control Tower, not by students.
+AWS_MANAGED_LOG_GROUP_PREFIXES = ("aws-controltower/", "/aws/controltower/", "/aws/lambda/aws-controltower-")
+
+
+@_uses("list_stacks", "list_stack_resources")
+def _cloudformation_stacks(c, inv=None):
+    """Every stack except DELETE_COMPLETE. Physical resources of protected stacks become protected."""
+    statuses = [s for s in c.meta.service_model.shape_for("StackStatus").enum if s != "DELETE_COMPLETE"]
+    out = []
+    for s in _items(c, "list_stacks", "StackSummaries", StackStatusFilter=statuses):
+        name = s["StackName"]
+        if inv is not None and inv.is_protected(name):
+            try:
+                inv.add_protected_ids(r.get("PhysicalResourceId") for r in _items(
+                    c, "list_stack_resources", "StackResourceSummaries", StackName=s.get("StackId") or name))
+            except Exception as e:  # the stack itself is still protected
+                log("보호 스택 %s 리소스 목록 실패: %s" % (name, _err(e)[0]))
+        out.append((name, s.get("StackStatus")))
+    return out
+
+
+def _sagemaker_app_id(a: dict) -> str:
+    parts = (a.get("DomainId"), a.get("UserProfileName") or a.get("SpaceName"), a.get("AppType"), a.get("AppName"))
+    return "/".join(p for p in parts if p)
+
+
+EMR_ACTIVE = ["STARTING", "BOOTSTRAPPING", "RUNNING", "WAITING", "TERMINATING"]
+
+# (inventory type, boto3 service, check(client, inventory) -> list of ids or (id, state)).
+# ec2_instances first (it detects dead/disabled regions), cloudformation_stacks second (it collects
+# the physical IDs of protected stacks before the other checks of the same region run).
 REGIONAL_CHECKS = [
     ("ec2_instances", "ec2", _ec2_instances),
-    ("ebs_volumes", "ec2", lambda c: [v["VolumeId"] for v in _items(c, "describe_volumes", "Volumes")]),
-    ("ebs_snapshots", "ec2", lambda c: [s["SnapshotId"] for s in
-                                        _items(c, "describe_snapshots", "Snapshots", OwnerIds=["self"])]),
-    ("elastic_ips", "ec2", lambda c: [a.get("AllocationId") or a.get("PublicIp")
-                                      for a in c.describe_addresses().get("Addresses", [])]),
-    ("nat_gateways", "ec2", lambda c: [n["NatGatewayId"] for n in _items(c, "describe_nat_gateways", "NatGateways")
-                                       if n.get("State") not in ("deleted", "failed")]),
-    ("load_balancers_v2", "elbv2", lambda c: [lb["LoadBalancerName"] for lb in
-                                              _items(c, "describe_load_balancers", "LoadBalancers")]),
-    ("load_balancers_classic", "elb", lambda c: [lb["LoadBalancerName"] for lb in
-                                                 _items(c, "describe_load_balancers", "LoadBalancerDescriptions")]),
-    ("rds_instances", "rds", lambda c: [d["DBInstanceIdentifier"] for d in
-                                        _items(c, "describe_db_instances", "DBInstances")]),
-    ("rds_clusters", "rds", lambda c: [d["DBClusterIdentifier"] for d in
-                                       _items(c, "describe_db_clusters", "DBClusters")]),
+    ("cloudformation_stacks", "cloudformation", _cloudformation_stacks),
+    # --- EC2 / VPC
+    ("ebs_volumes", "ec2", _list("describe_volumes", "Volumes", "VolumeId", "State")),
+    ("ebs_snapshots", "ec2", _list("describe_snapshots", "Snapshots", "SnapshotId", OwnerIds=["self"])),
+    ("amis", "ec2", _list("describe_images", "Images", "ImageId", "State", Owners=["self"])),
+    ("elastic_ips", "ec2", _elastic_ips),
+    ("nat_gateways", "ec2", _list("describe_nat_gateways", "NatGateways", "NatGatewayId", "State",
+                                  skip=lambda n: n.get("State") == "failed")),
+    ("vpc_endpoints", "ec2", _list("describe_vpc_endpoints", "VpcEndpoints", "VpcEndpointId", "State",
+                                   skip=lambda e: e.get("VpcEndpointType") == "Gateway"
+                                   or str(e.get("State", "")).lower() in ("rejected", "failed", "expired"))),
+    ("vpcs", "ec2", _list("describe_vpcs", "Vpcs", "VpcId", skip=lambda v: v.get("IsDefault"))),
+    ("subnets", "ec2", _list("describe_subnets", "Subnets", "SubnetId", skip=lambda s: s.get("DefaultForAz"))),
+    ("security_groups", "ec2", _list("describe_security_groups", "SecurityGroups",
+                                     lambda g: "%s/%s" % (g["GroupId"], g.get("GroupName", "")),
+                                     skip=lambda g: g.get("GroupName") == "default")),
+    ("internet_gateways", "ec2", _internet_gateways),
+    ("transit_gateways", "ec2", _list("describe_transit_gateways", "TransitGateways", "TransitGatewayId", "State")),
+    ("vpn_connections", "ec2", _vpn_connections),
+    ("load_balancers_v2", "elbv2", _list("describe_load_balancers", "LoadBalancers", "LoadBalancerName", "State.Code")),
+    ("load_balancers_classic", "elb", _list("describe_load_balancers", "LoadBalancerDescriptions", "LoadBalancerName")),
+    ("autoscaling_groups", "autoscaling", _list("describe_auto_scaling_groups", "AutoScalingGroups",
+                                                "AutoScalingGroupName", "Status")),
+    # --- databases / caches / analytics
+    ("rds_instances", "rds", _list("describe_db_instances", "DBInstances", "DBInstanceIdentifier", "DBInstanceStatus")),
+    ("rds_clusters", "rds", _list("describe_db_clusters", "DBClusters", "DBClusterIdentifier", "Status")),
+    ("rds_snapshots_manual", "rds", _list("describe_db_snapshots", "DBSnapshots", "DBSnapshotIdentifier",
+                                          SnapshotType="manual")),
+    ("rds_cluster_snapshots_manual", "rds", _list("describe_db_cluster_snapshots", "DBClusterSnapshots",
+                                                  "DBClusterSnapshotIdentifier", SnapshotType="manual")),
+    ("dynamodb_tables", "dynamodb", _list("list_tables", "TableNames")),
+    ("elasticache_clusters", "elasticache", _list("describe_cache_clusters", "CacheClusters", "CacheClusterId",
+                                                  "CacheClusterStatus")),
+    ("elasticache_serverless_caches", "elasticache", _list("describe_serverless_caches", "ServerlessCaches",
+                                                           "ServerlessCacheName", "Status")),
+    ("memorydb_clusters", "memorydb", _list("describe_clusters", "Clusters", "Name", "Status")),
+    ("redshift_clusters", "redshift", _list("describe_clusters", "Clusters", "ClusterIdentifier", "ClusterStatus")),
+    ("redshift_serverless_workgroups", "redshift-serverless", _list("list_workgroups", "workgroups",
+                                                                    "workgroupName", "status")),
+    ("redshift_serverless_namespaces", "redshift-serverless", _list("list_namespaces", "namespaces",
+                                                                    "namespaceName", "status")),
+    ("opensearch_domains", "opensearch", _list("list_domain_names", "DomainNames", "DomainName")),
     ("opensearch_serverless_collections", "opensearchserverless",
-     lambda c: [x.get("name") or x.get("id") for x in _items(c, "list_collections", "collectionSummaries")]),
-    ("sagemaker_endpoints", "sagemaker", lambda c: [e["EndpointName"] for e in
-                                                    _items(c, "list_endpoints", "Endpoints")]),
-    ("sagemaker_notebook_instances", "sagemaker", lambda c: [n["NotebookInstanceName"] for n in
-                                                             _items(c, "list_notebook_instances", "NotebookInstances")]),
-    ("bedrock_provisioned_throughputs", "bedrock",
-     lambda c: [p.get("provisionedModelName") or p.get("provisionedModelArn") for p in
-                _items(c, "list_provisioned_model_throughputs", "provisionedModelSummaries")]),
-    ("bedrock_custom_models", "bedrock", lambda c: [m.get("modelName") or m.get("modelArn") for m in
-                                                    _items(c, "list_custom_models", "modelSummaries")]),
-    ("bedrock_imported_models", "bedrock", lambda c: [m.get("modelName") or m.get("modelArn") for m in
-                                                      _items(c, "list_imported_models", "modelSummaries")]),
-    ("lambda_functions", "lambda", lambda c: [f["FunctionName"] for f in _items(c, "list_functions", "Functions")]),
-    ("dynamodb_tables", "dynamodb", lambda c: list(_items(c, "list_tables", "TableNames"))),
-    ("ecs_clusters", "ecs", lambda c: [a.split("/")[-1] for a in _items(c, "list_clusters", "clusterArns")]),
-    ("eks_clusters", "eks", lambda c: list(_items(c, "list_clusters", "clusters"))),
+     _list("list_collections", "collectionSummaries", lambda x: x.get("name") or x.get("id"), "status")),
+    ("kinesis_streams", "kinesis", _list("list_streams", "StreamSummaries", "StreamName", "StreamStatus")),
+    ("firehose_streams", "firehose", _firehose_streams),
+    ("msk_clusters", "kafka", _list("list_clusters_v2", "ClusterInfoList", "ClusterName", "State")),
+    ("glue_jobs", "glue", _list("get_jobs", "Jobs", "Name")),
+    ("glue_crawlers", "glue", _list("get_crawlers", "Crawlers", "Name")),
+    ("emr_clusters", "emr", _list("list_clusters", "Clusters", lambda x: "%s/%s" % (x["Id"], x.get("Name", "")),
+                                  ClusterStates=EMR_ACTIVE)),
+    ("kendra_indexes", "kendra", _list("list_indices", "IndexConfigurationSummaryItems",
+                                       lambda x: x.get("Name") or x.get("Id"), "Status")),
+    ("dms_replication_instances", "dms", _list("describe_replication_instances", "ReplicationInstances",
+                                               "ReplicationInstanceIdentifier", "ReplicationInstanceStatus")),
+    # --- compute / containers / serverless
+    ("lambda_functions", "lambda", _list("list_functions", "Functions", "FunctionName")),
+    ("apigateway_rest_apis", "apigateway", _list("get_rest_apis", "items",
+                                                 lambda x: "%s/%s" % (x["id"], x.get("name", "")))),
+    ("apigateway_v2_apis", "apigatewayv2", _list("get_apis", "Items", lambda x: "%s/%s" % (x["ApiId"], x.get("Name", "")))),
+    ("ecs_clusters", "ecs", _list("list_clusters", "clusterArns", lambda a: a.rsplit("/", 1)[-1])),
+    ("ecs_services", "ecs", _ecs_services),
+    ("eks_clusters", "eks", _list("list_clusters", "clusters")),
+    ("ecr_repositories", "ecr", _list("describe_repositories", "repositories", "repositoryName")),
+    ("apprunner_services", "apprunner", _list("list_services", "ServiceSummaryList", "ServiceName", "Status")),
+    ("elasticbeanstalk_environments", "elasticbeanstalk", _list("describe_environments", "Environments",
+                                                                "EnvironmentName", "Status", IncludeDeleted=False)),
+    ("lightsail_instances", "lightsail", _list("get_instances", "instances", "name", "state.name")),
+    ("lightsail_databases", "lightsail", _list("get_relational_databases", "relationalDatabases", "name", "state")),
+    ("workspaces", "workspaces", _list("describe_workspaces", "Workspaces", "WorkspaceId", "State")),
+    ("directory_service_directories", "ds", _list("describe_directories", "DirectoryDescriptions",
+                                                  lambda d: "%s/%s" % (d["DirectoryId"], d.get("Name", "")), "Stage")),
+    ("mwaa_environments", "mwaa", _list("list_environments", "Environments")),
+    ("amplify_apps", "amplify", _list("list_apps", "apps", lambda a: "%s/%s" % (a["appId"], a.get("name", "")))),
+    ("stepfunctions_state_machines", "stepfunctions", _list("list_state_machines", "stateMachines", "name")),
+    ("mq_brokers", "mq", _list("list_brokers", "BrokerSummaries", "BrokerName", "BrokerState")),
+    # --- storage
+    ("efs_file_systems", "efs", _list("describe_file_systems", "FileSystems", "FileSystemId", "LifeCycleState")),
+    ("fsx_file_systems", "fsx", _list("describe_file_systems", "FileSystems", "FileSystemId", "Lifecycle")),
+    # --- ML / AI
+    ("sagemaker_endpoints", "sagemaker", _list("list_endpoints", "Endpoints", "EndpointName", "EndpointStatus")),
+    ("sagemaker_notebook_instances", "sagemaker", _list("list_notebook_instances", "NotebookInstances",
+                                                        "NotebookInstanceName", "NotebookInstanceStatus")),
+    ("sagemaker_domains", "sagemaker", _list("list_domains", "Domains",
+                                             lambda d: "%s/%s" % (d["DomainId"], d.get("DomainName", "")), "Status")),
+    ("sagemaker_apps", "sagemaker", _list("list_apps", "Apps", _sagemaker_app_id, "Status")),
+    ("bedrock_custom_models", "bedrock", _list("list_custom_models", "modelSummaries",
+                                               lambda m: m.get("modelName") or m.get("modelArn"))),
+    ("bedrock_imported_models", "bedrock", _list("list_imported_models", "modelSummaries",
+                                                 lambda m: m.get("modelName") or m.get("modelArn"))),
+    ("bedrock_provisioned_throughputs", "bedrock", _list("list_provisioned_model_throughputs", "provisionedModelSummaries",
+                                                         lambda p: p.get("provisionedModelName") or p.get("provisionedModelArn"),
+                                                         "status")),
+    ("bedrock_agents", "bedrock-agent", _list("list_agents", "agentSummaries",
+                                              lambda a: "%s/%s" % (a["agentId"], a.get("agentName", "")), "agentStatus")),
+    ("bedrock_knowledge_bases", "bedrock-agent", _list("list_knowledge_bases", "knowledgeBaseSummaries",
+                                                       lambda k: "%s/%s" % (k["knowledgeBaseId"], k.get("name", "")),
+                                                       "status")),
+    # --- integration / security / ops
+    ("sqs_queues", "sqs", _list("list_queues", "QueueUrls", lambda u: u.rstrip("/").rsplit("/", 1)[-1])),
+    ("sns_topics", "sns", _list("list_topics", "Topics", lambda t: t["TopicArn"].rsplit(":", 1)[-1])),
+    ("secretsmanager_secrets", "secretsmanager", _list("list_secrets", "SecretList", "Name")),
+    ("kms_customer_keys", "kms", _kms_keys),
+    ("cloudwatch_log_groups", "logs", _list("describe_log_groups", "logGroups", "logGroupName",
+                                            skip=lambda g: str(g.get("logGroupName", "")).startswith(
+                                                AWS_MANAGED_LOG_GROUP_PREFIXES))),
+    ("cloudwatch_alarms", "cloudwatch", _cloudwatch_alarms),
+    ("route53_resolver_endpoints", "route53resolver", _list("list_resolver_endpoints", "ResolverEndpoints",
+                                                            lambda r: "%s/%s" % (r["Id"], r.get("Name", "")), "Status")),
+    ("network_firewalls", "network-firewall", _list("list_firewalls", "Firewalls", "FirewallName")),
 ]
 
-REGION_DEAD_CODES = {"AuthFailure", "OptInRequired", "UnrecognizedClientException", "InvalidClientTokenId",
-                     "EndpointConnectionError", "ConnectTimeoutError"}
+
+@_uses("list_distributions")
+def _cloudfront_distributions(c, inv=None):
+    out = []
+    for page in c.get_paginator("list_distributions").paginate():
+        for d in (page.get("DistributionList") or {}).get("Items", []) or []:
+            out.append(("%s/%s" % (d["Id"], d.get("DomainName", "")), d.get("Status")))
+    return out
+
+
+@_uses("list_users")
+def _iam_users(c, inv=None):
+    return [u["UserName"] for u in _items(c, "list_users", "Users")]
+
+
+SERVICE_ROLE_PATHS = ("/aws-service-role/", "/aws-reserved/")
+
+
+@_uses("list_roles")
+def _iam_roles(c, inv=None):
+    """Roles except service-linked (/aws-service-role/) and SSO-reserved (/aws-reserved/) ones."""
+    return [r["RoleName"] for r in _items(c, "list_roles", "Roles")
+            if not str(r.get("Path", "/")).startswith(SERVICE_ROLE_PATHS) and r["RoleName"] != ROLE_NAME]
+
+
+# Global services (queried once via us-east-1, recorded under "global"); S3 is separate (per bucket region).
+GLOBAL_CHECKS = [
+    ("cloudfront_distributions", "cloudfront", _cloudfront_distributions),
+    ("route53_hosted_zones", "route53", _list("list_hosted_zones", "HostedZones",
+                                              lambda z: "%s/%s" % (z["Name"], z["Id"].rsplit("/", 1)[-1]))),
+    ("iam_users", "iam", _iam_users),
+    ("iam_roles", "iam", _iam_roles),
+]
+
 MAX_IDS = 20
+
+# --- error classification -----------------------------------------------------------------
+KIND_NA = "not_applicable"
+KIND_BLOCKED = "blocked_by_policy"
+KIND_ERROR = "error"
+
+# Service/API not offered (or region not enabled) -> not applicable, never a failure.
+NA_CODES = {"InvalidAction", "UnrecognizedClientException", "InvalidClientTokenId", "AuthFailure", "OptInRequired",
+            "SubscriptionRequiredException", "SubscriptionRequired", "UnknownOperationException",
+            "UnsupportedOperation", "UnsupportedOperationException"}
+NA_EXCEPTIONS = {"EndpointConnectionError", "UnknownEndpointError", "EndpointResolutionError", "UnknownRegionError",
+                 "NoRegionError", "UnknownEndpoint"}
+NA_MESSAGES = ("not authorized for region", "not authorized to use this region", "not supported in this region",
+               "not supported in the region", "not supported in region", "not available in this region",
+               "not available in the region", "not available in region", "region is not enabled",
+               "region not enabled", "needs a subscription")
+# Denied by a policy (with AdministratorAccess this is an SCP or permission boundary) -> counted separately.
+BLOCKED_CODES = {"AccessDenied", "AccessDeniedException", "UnauthorizedOperation", "UnauthorizedException",
+                 "AuthorizationError", "AuthorizationErrorException", "Forbidden", "ForbiddenException",
+                 "NotAuthorized"}
+CREDENTIAL_CODES = {"ExpiredToken", "ExpiredTokenException", "RequestExpired", "SignatureDoesNotMatch",
+                    "InvalidSignatureException", "InvalidAccessKeyId"}
+# A dead or disabled region: after ec2_instances fails like this, the rest of the region is n/a.
+REGION_DEAD_CODES = {"AuthFailure", "OptInRequired", "UnrecognizedClientException", "InvalidClientTokenId",
+                     "EndpointConnectionError"}
 
 
 def _err(e: Exception) -> Tuple[str, str]:
@@ -491,37 +863,125 @@ def _err(e: Exception) -> Tuple[str, str]:
     return type(e).__name__, str(e)
 
 
+def classify_check_error(e: Exception) -> Tuple[str, str, str]:
+    """-> (kind, code, message). kind: not_applicable | blocked_by_policy | error."""
+    code, msg = _err(e)
+    low = str(msg).lower()
+    if type(e).__name__ in NA_EXCEPTIONS or code in NA_CODES:
+        return KIND_NA, code, msg
+    if code in CREDENTIAL_CODES:
+        return KIND_ERROR, code, msg
+    if "service control policy" in low or "explicit deny" in low:
+        return KIND_BLOCKED, code + " (SCP)", msg
+    if any(m in low for m in NA_MESSAGES):
+        return KIND_NA, code, msg
+    status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode") if isinstance(e, ClientError) else None
+    if code in BLOCKED_CODES or "accessdenied" in code.lower() or status == 403:
+        return KIND_BLOCKED, code, msg
+    return KIND_ERROR, code, msg
+
+
 class Inventory:
-    def __init__(self, protected_prefixes: Tuple[str, ...] = PROTECTED_PREFIXES) -> None:
+    def __init__(self, protected_prefixes: Tuple[str, ...] = PROTECTED_PREFIXES,
+                 protected_names: Tuple[str, ...] = ()) -> None:
         self.protected_prefixes = tuple(protected_prefixes)
+        self.protected_names = set(protected_names)  # exact names (e.g. the caller's IAM user)
+        self.protected_ids: set = set()               # physical IDs of protected CloudFormation stacks
         self.counts: Dict[str, Dict[str, int]] = {}
         self.items: Dict[str, Dict[str, List[str]]] = {}
         self.protected: Dict[str, Dict[str, List[str]]] = {}
+        self.deleting: Dict[str, Dict[str, int]] = {}
         self.unchecked: Dict[str, Dict[str, str]] = {}
+        self.not_applicable: Dict[str, Dict[str, str]] = {}
+        self.blocked: Dict[str, Dict[str, str]] = {}
         self.errors: List[Dict[str, Any]] = []
+        self.checked = 0
         self._lock = threading.Lock()
 
-    def record(self, region: str, rtype: str, ids: List[Any]) -> None:
-        prot = [str(i) for i in ids if isinstance(i, str) and i.startswith(self.protected_prefixes)]
-        keep = [str(i) for i in ids if not (isinstance(i, str) and i.startswith(self.protected_prefixes))]
+    # -- protection
+    def add_protected_ids(self, ids) -> None:
+        """Physical IDs come as names, ARNs or URLs (SQS): keep the full ID and its last segment."""
+        new = set()
+        for i in ids:
+            if not i:
+                continue
+            s = str(i)
+            new.add(s)
+            new.add(re.split(r"[/:]", s.rstrip("/"))[-1])
         with self._lock:
+            self.protected_ids.update(x for x in new if len(x) >= 8)
+
+    def is_protected(self, ident: str) -> bool:
+        s = str(ident)
+        if s in self.protected_names or s.startswith(self.protected_prefixes) or s in self.protected_ids:
+            return True
+        for seg in re.split(r"[/:]", s):
+            if seg and (seg.startswith(self.protected_prefixes) or seg in self.protected_ids
+                        or seg in self.protected_names):
+                return True
+        return False
+
+    # -- results
+    def record(self, region: str, rtype: str, found: List[Any]) -> None:
+        keep: List[str] = []
+        prot: List[str] = []
+        deleting = 0
+        for x in found:
+            ident, st = x if isinstance(x, tuple) else (x, None)
+            if ident is None:
+                continue
+            ident = str(ident)
+            if self.is_protected(ident):
+                prot.append(ident)
+                continue
+            if _is_deleting(st):
+                deleting += 1
+                ident = "%s (%s)" % (ident, st)
+            keep.append(ident)
+        with self._lock:
+            self.checked += 1
             self.counts.setdefault(region, {})
             self.counts[region][rtype] = self.counts[region].get(rtype, 0) + len(keep)
             if keep:
                 lst = self.items.setdefault(region, {}).setdefault(rtype, [])
                 lst.extend(keep[:max(0, MAX_IDS - len(lst))])
+            if deleting:
+                per = self.deleting.setdefault(region, {})
+                per[rtype] = per.get(rtype, 0) + deleting
             if prot:
                 self.protected.setdefault(region, {}).setdefault(rtype, []).extend(prot)
 
-    def fail(self, region: str, rtype: str, code: str, message: str, is_error: bool = True) -> None:
+    def fail(self, region: str, rtype: str, code: str, message: str, kind: str = KIND_ERROR) -> None:
         with self._lock:
-            self.unchecked.setdefault(region, {})[rtype] = code
-            if is_error:
+            if kind == KIND_NA:
+                self.not_applicable.setdefault(region, {})[rtype] = code
+            elif kind == KIND_BLOCKED:
+                self.blocked.setdefault(region, {})[rtype] = code
+            else:
+                self.unchecked.setdefault(region, {})[rtype] = code
                 self.errors.append({"stage": "inventory", "region": region, "check": rtype,
-                                    "code": code, "message": message[:300]})
+                                    "code": code, "message": str(message)[:300]})
+
+    def fail_exc(self, region: str, rtype: str, e: Exception) -> str:
+        kind, code, msg = classify_check_error(e)
+        self.fail(region, rtype, code, msg, kind)
+        return kind
 
     def total(self) -> int:
         return sum(n for per in self.counts.values() for n in per.values())
+
+    @staticmethod
+    def _n(d: Dict[str, Dict[str, Any]]) -> int:
+        return sum(len(per) for per in d.values())
+
+    def blocked_count(self) -> int:
+        return self._n(self.blocked)
+
+    def not_applicable_count(self) -> int:
+        return self._n(self.not_applicable)
+
+    def examples(self, n: int) -> Dict[str, Dict[str, List[str]]]:
+        return {r: {t: ids[:n] for t, ids in per.items() if ids} for r, per in self.items.items()}
 
 
 def _available(session, service: str, cache: Dict[str, List[str]]) -> List[str]:
@@ -535,23 +995,24 @@ def _available(session, service: str, cache: Dict[str, List[str]]) -> List[str]:
 
 def inventory_region(session, region: str, inv: Inventory, avail_cache: Dict[str, List[str]]) -> None:
     dead: Optional[Tuple[str, str]] = None
+    clients: Dict[str, Any] = {}
     for rtype, service, fn in REGIONAL_CHECKS:
         if dead:
-            inv.fail(region, rtype, dead[0], dead[1], is_error=False)
+            inv.fail(region, rtype, dead[0], dead[1], KIND_NA)
             continue
         avail = _available(session, service, avail_cache)
         if avail and region not in avail:
-            inv.fail(region, rtype, "NotAvailableInRegion",
-                     "botocore endpoint metadata에 이 리전이 없음", is_error=False)
+            inv.fail(region, rtype, "NotAvailableInRegion", "botocore endpoint metadata에 이 리전이 없음", KIND_NA)
             continue
         try:
-            ids = fn(_client(session, service, region))
-            inv.record(region, rtype, ids)
-        except Exception as e:  # any failure = "could not check", never a crash
-            code, msg = _err(e)
-            inv.fail(region, rtype, code, msg)
-            if rtype == "ec2_instances" and code in REGION_DEAD_CODES:
-                dead = (code, "리전 접근 불가로 나머지 검사 생략: " + msg)
+            if service not in clients:
+                clients[service] = _client(session, service, region)
+            inv.record(region, rtype, fn(clients[service], inv))
+        except Exception as e:  # any failure = n/a, blocked or "could not check" - never a crash
+            kind = inv.fail_exc(region, rtype, e)
+            code = _err(e)[0]
+            if rtype == "ec2_instances" and kind == KIND_NA and code in REGION_DEAD_CODES:
+                dead = (code, "리전 사용 불가로 나머지 검사 생략: " + str(_err(e)[1])[:200])
 
 
 def inventory_s3(session, inv: Inventory) -> None:
@@ -564,9 +1025,9 @@ def inventory_s3(session, inv: Inventory) -> None:
         else:
             buckets = s3.list_buckets().get("Buckets", [])
     except Exception as e:
-        code, msg = _err(e)
-        inv.fail("global", "s3_buckets", code, msg)
+        inv.fail_exc("global", "s3_buckets", e)
         return
+    by_region: Dict[str, List[str]] = {}
     for b in buckets:
         region = b.get("BucketRegion")
         if not region:
@@ -575,7 +1036,34 @@ def inventory_s3(session, inv: Inventory) -> None:
                 region = {None: "us-east-1", "": "us-east-1", "EU": "eu-west-1"}.get(loc, loc)
             except Exception:
                 region = "unknown"
-        inv.record(region, "s3_buckets", [b["Name"]])
+        by_region.setdefault(region, []).append(b["Name"])
+    if not by_region:
+        inv.record("global", "s3_buckets", [])
+    for region, names in by_region.items():
+        inv.record(region, "s3_buckets", names)
+
+
+def inventory_global(session, inv: Inventory) -> None:
+    for rtype, service, fn in GLOBAL_CHECKS:
+        try:
+            inv.record("global", rtype, fn(_client(session, service, "us-east-1"), inv))
+        except Exception as e:
+            inv.fail_exc("global", rtype, e)
+    inventory_s3(session, inv)
+
+
+def _caller_names(session) -> Tuple[str, ...]:
+    """IAM user / role name of whoever runs this (protected: CONTRACTS 'protect the running user')."""
+    try:
+        arn = caller_arn(session)
+    except Exception:
+        return ()
+    kind, _, rest = str(arn).split(":", 5)[-1].partition("/")  # user/<path>/name | assumed-role/Role/sess | root
+    if kind == "user" and rest:
+        return (rest.rsplit("/", 1)[-1],)
+    if kind == "assumed-role" and rest:
+        return (rest.split("/", 1)[0],)
+    return ()
 
 
 def resolve_inventory_regions(session, args, errors: List[Dict[str, Any]]) -> List[str]:
@@ -605,26 +1093,36 @@ def resolve_inventory_regions(session, args, errors: List[Dict[str, Any]]) -> Li
 
 def run_inventory(session, regions: List[str],
                   protected_prefixes: Tuple[str, ...] = PROTECTED_PREFIXES) -> Inventory:
-    inv = Inventory(protected_prefixes)
+    inv = Inventory(protected_prefixes, _caller_names(session))
     cache: Dict[str, List[str]] = {}
     for svc in {s for _, s, _ in REGIONAL_CHECKS}:
         _available(session, svc, cache)  # warm the cache before threads start
     workers = max(1, min(8, len(regions)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         list(pool.map(lambda r: inventory_region(session, r, inv, cache), regions))
-    inventory_s3(session, inv)
+    # after the regions: protected stacks of every region are known (IAM roles, buckets they own)
+    inventory_global(session, inv)
     return inv
 
 
 # --------------------------------------------------------------------------- verdict & output
 def decide(flagged: List[dict], inv_total: int, fatal: bool, pending: List[str]) -> str:
-    """Priority: RESIDUAL (known leftovers) > ERROR > PENDING > CLEAN."""
+    """Cost mode. Priority: RESIDUAL (known leftovers) > ERROR > PENDING > CLEAN."""
     if flagged or inv_total > 0:
         return STATUS_RESIDUAL
     if fatal:
         return STATUS_ERROR
     if pending:
         return STATUS_PENDING
+    return STATUS_CLEAN
+
+
+def decide_inventory(inv_total: int, checked: int) -> str:
+    """Inventory mode: RESIDUAL if anything unprotected was found; ERROR only if nothing could be checked."""
+    if inv_total > 0:
+        return STATUS_RESIDUAL
+    if checked == 0:
+        return STATUS_ERROR
     return STATUS_CLEAN
 
 
@@ -637,10 +1135,8 @@ PENDING_TEXT = {
 }
 
 
-def render_summary(res: Dict[str, Any]) -> str:
-    out: List[str] = []
+def _render_cost(res: Dict[str, Any], out: List[str]) -> None:
     w = res["window"]
-    out.append("[verify] 계정 %s  판정: %s (exit %d)" % (res["account_id"], res["status"], res["exit_code"]))
     span = "%s ~ %s (UTC, %d일)" % (w["start"], w["end"], w["days"]) if w.get("end") else "%s ~ (아직 없음)" % w["start"]
     out.append("정리일: %s   검사 구간: %s   최초 판정 가능: %s" % (
         res["cleanup_date"], span, w["earliest_verdict_kst"]))
@@ -667,24 +1163,67 @@ def render_summary(res: Dict[str, Any]) -> str:
     if res["allowed"]:
         out.append("허용 목록으로 통과: %d건 (합계 $%.4f)" % (
             len(res["allowed"]), sum(a["amount_usd"] for a in res["allowed"])))
+
+
+def _render_inventory(res: Dict[str, Any], out: List[str]) -> None:
+    found = {r: {t: n for t, n in per.items() if n} for r, per in res["inventory"].items()}
+    found = {r: per for r, per in found.items() if per}
+    scope = "%d개 리전 + global" % len(res["inventory_regions"])
+    if found:
+        regions = sorted(found, key=lambda r: (r == "global", r))
+        types = sorted({t for per in found.values() for t in per})
+        w0 = max(len("유형"), max(len(t) for t in types))
+        widths = [max(len(r), 3) for r in regions]
+        out.append("인벤토리 잔여물 (%s, 0이 아닌 것만):" % scope)
+        out.append("  " + "유형".ljust(w0 - 2) + "  " + "  ".join(r.rjust(wd) for r, wd in zip(regions, widths)))
+        for t in types:
+            cells = [str(found[r].get(t, "-")).rjust(wd) for r, wd in zip(regions, widths)]
+            out.append("  " + t.ljust(w0) + "  " + "  ".join(cells))
+        n = res.get("max_examples", 5)
+        if n:
+            out.append("예시 ID (유형별 최대 %d개):" % n)
+            for region in regions:
+                for rtype, ids in sorted(res["examples"].get(region, {}).items()):
+                    more = found[region].get(rtype, 0) - len(ids)
+                    out.append("  [%s] %s: %s%s" % (region, rtype, ", ".join(ids), " 외 %d개" % more if more > 0 else ""))
+        deleting = sum(n for per in res.get("inventory_deleting", {}).values() for n in per.values())
+        if deleting:
+            out.append("  ※ 이 중 %d개는 삭제/종료 진행 중 상태 → 몇 분 뒤 다시 실행하면 사라질 수 있음" % deleting)
+    else:
+        out.append("인벤토리 잔여물: 없음 (%s)" % scope)
+    prot = sum(len(ids) for per in res["inventory_protected"].values() for ids in per.values())
+    if prot:
+        out.append("보호 대상으로 제외: %d개 (edu-bootstrap/EduCleanupRole/edu-killswitch/조직 관리 리소스 등)" % prot)
+    if res["blocked_by_policy_count"]:
+        out.append("정책(SCP 등)으로 조회 차단: %d건 (잔여물로 세지 않음, 이 범위는 확인 못 함)" % res["blocked_by_policy_count"])
+        for region in sorted(res["blocked_by_policy"]):
+            per = res["blocked_by_policy"][region]
+            out.append("  %s: %s" % (region, ", ".join(sorted(per))))
+    if res["not_applicable_count"]:
+        out.append("해당 없음(n/a, 리전에 없는 서비스·비활성 리전): %d건" % res["not_applicable_count"])
+    if res["inventory_unchecked"]:
+        out.append("확인 못 함 (오류):")
+        for region in sorted(res["inventory_unchecked"]):
+            per = res["inventory_unchecked"][region]
+            out.append("  %s: %s" % (region, ", ".join("%s(%s)" % kv for kv in sorted(per.items()))))
+
+
+def render_summary(res: Dict[str, Any]) -> str:
+    out: List[str] = []
+    mode_txt = {MODE_INVENTORY: "인벤토리(Cost Explorer 미사용)", MODE_COST: "비용(Cost Explorer)"}.get(res.get("mode"), "?")
+    if res.get("ce_fallback"):
+        mode_txt += " ← auto: Cost Explorer 사용 불가로 대체"
+    out.append("[verify] 계정 %s  판정: %s (exit %d)  모드: %s" % (
+        res["account_id"], res["status"], res["exit_code"], mode_txt))
+    if res.get("mode") == MODE_COST:
+        _render_cost(res, out)
+    elif res.get("cleanup_date"):
+        out.append("정리일: %s (인벤토리 모드는 대기 없이 바로 판정)" % res["cleanup_date"])
+    if res.get("ce_fallback"):
+        fb = res["ce_fallback"]
+        out.append("Cost Explorer: %s %s" % (fb.get("code"), str(fb.get("message", ""))[:160]))
     if res.get("inventory_ran"):
-        found = {r: {t: n for t, n in per.items() if n} for r, per in res["inventory"].items()}
-        found = {r: per for r, per in found.items() if per}
-        if found:
-            out.append("인벤토리 잔여물:")
-            for region in sorted(found):
-                out.append("  %s: %s" % (region, ", ".join("%s=%d" % kv for kv in sorted(found[region].items()))))
-                for rtype, ids in sorted(res["inventory_items"].get(region, {}).items()):
-                    out.append("      %s: %s" % (rtype, ", ".join(ids[:5]) + (" ..." if len(ids) > 5 else "")))
-        else:
-            out.append("인벤토리 잔여물: 없음 (%d개 리전 + S3)" % len(res["inventory_regions"]))
-        unchecked = {r: {t: c for t, c in per.items() if c != "NotAvailableInRegion"}
-                     for r, per in res["inventory_unchecked"].items()}
-        unchecked = {r: per for r, per in unchecked.items() if per}
-        if unchecked:
-            out.append("확인 못 함 (권한/오류):")
-            for region in sorted(unchecked):
-                out.append("  %s: %s" % (region, ", ".join("%s(%s)" % kv for kv in sorted(unchecked[region].items()))))
+        _render_inventory(res, out)
     for wmsg in res.get("warnings", []):
         out.append("주의: " + wmsg)
     for e in res["errors"]:
@@ -694,10 +1233,16 @@ def render_summary(res: Dict[str, Any]) -> str:
         if e.get("hint"):
             out.append("  → " + e["hint"])
     if res["status"] == STATUS_RESIDUAL:
-        out.append("다음 할 일: 위 리전/서비스의 리소스를 지우거나 해당 리전을 포함해 aws-nuke를 다시 돌린 뒤, "
-                   "그 날짜를 --cleanup-date로 넣어 D+2에 다시 검증하세요.")
+        if res.get("mode") == MODE_INVENTORY:
+            out.append("다음 할 일: 위 리소스를 지우거나(필요하면 해당 리전/유형을 넣어 aws-nuke 재실행) "
+                       "바로 다시 --mode inventory 로 검증하세요.")
+        else:
+            out.append("다음 할 일: 위 리전/서비스의 리소스를 지우거나 해당 리전을 포함해 aws-nuke를 다시 돌린 뒤, "
+                       "그 날짜를 --cleanup-date로 넣어 D+2에 다시 검증하세요.")
     elif res["status"] == STATUS_PENDING:
-        out.append("다음 할 일: %s 이후 다시 실행하세요." % w["earliest_verdict_kst"])
+        out.append("다음 할 일: %s 이후 다시 실행하세요." % res["window"]["earliest_verdict_kst"])
+    elif res["status"] == STATUS_CLEAN and res.get("mode") == MODE_INVENTORY:
+        out.append("참고: 목록에 없는 리소스 유형은 잡지 못합니다. 비용 확정은 리셀러 청구서로 확인하세요.")
     return "\n".join(out)
 
 
@@ -710,6 +1255,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         log("예상치 못한 오류: %s %s" % (code, msg))
         write_json(args.json_out, {"module": MODULE, "account_id": None, "generated_at": now_iso(),
                                    "applied": False, "status": STATUS_ERROR, "exit_code": EXIT_ERROR,
+                                   "mode": None, "mode_requested": args.mode,
                                    "errors": [{"stage": "internal", "code": code, "message": msg, "hint": ""}]})
         print("[verify] 판정: ERROR (exit 2) - 예상치 못한 오류: %s %s" % (code, msg))
         return EXIT_ERROR
@@ -721,7 +1267,8 @@ def _run(args: argparse.Namespace) -> int:
 
     now = args.now or utc_now()
     today = now.date()
-    cleanup = args.cleanup_date or now.astimezone(KST).date()
+    inventory_only = args.mode == MODE_INVENTORY
+    cleanup = args.cleanup_date or (None if inventory_only else now.astimezone(KST).date())
     if args.record_types:
         rf = {"mode": "include", "values": parse_regions(args.record_types)}
     else:
@@ -731,13 +1278,16 @@ def _run(args: argparse.Namespace) -> int:
     res: Dict[str, Any] = {
         "module": MODULE, "account_id": None, "generated_at": now_iso(), "applied": False,
         "status": STATUS_ERROR, "exit_code": EXIT_ERROR,
-        "cleanup_date": cleanup.isoformat(), "now_utc": now.replace(microsecond=0).isoformat(),
+        "mode": MODE_INVENTORY if inventory_only else MODE_COST, "mode_requested": args.mode, "ce_fallback": None,
+        "cleanup_date": cleanup.isoformat() if cleanup else None, "now_utc": now.replace(microsecond=0).isoformat(),
         "today_utc": today.isoformat(), "settle_days": args.settle_days, "threshold_usd": args.threshold_usd,
         "record_filter": rf, "metric": CE_METRIC, "require_final": args.require_final,
         "window": {}, "ce_requests": 0, "data_final": None, "pending_reasons": [],
         "flagged": [], "allowed": [], "daily_totals": [],
         "inventory_ran": False, "inventory_regions": [], "inventory": {}, "inventory_items": {},
+        "examples": {}, "max_examples": args.max_examples, "inventory_deleting": {},
         "inventory_protected": {}, "inventory_unchecked": {}, "inventory_complete": None,
+        "not_applicable": {}, "not_applicable_count": 0, "blocked_by_policy": {}, "blocked_by_policy_count": 0,
         "warnings": [], "errors": [],
     }
 
@@ -748,17 +1298,20 @@ def _run(args: argparse.Namespace) -> int:
         print(render_summary(res))
         return res["exit_code"]
 
-    window = compute_window(cleanup, args.settle_days, args.lag_hours, args.days, now)
-    pending = window.pop("_pending")
-    res["window"] = window
-    res["pending_reasons"] = list(pending)
-
-    try:
-        rules = load_allowlist(args.allowlist)
-    except AllowlistError as e:
-        res["errors"].append({"stage": "args", "code": "InvalidAllowlist", "message": str(e), "hint": ""})
-        return finish(STATUS_ERROR)
-    res["allowlist_rules"] = len(rules)
+    pending: List[str] = []
+    window: Dict[str, Any] = {}
+    rules: List[Dict[str, Any]] = []
+    if not inventory_only:
+        window = compute_window(cleanup, args.settle_days, args.lag_hours, args.days, now)
+        pending = window.pop("_pending")
+        res["window"] = window
+        res["pending_reasons"] = list(pending)
+        try:
+            rules = load_allowlist(args.allowlist)
+        except AllowlistError as e:
+            res["errors"].append({"stage": "args", "code": "InvalidAllowlist", "message": str(e), "hint": ""})
+            return finish(STATUS_ERROR)
+        res["allowlist_rules"] = len(rules)
 
     try:
         session = get_session(args)
@@ -767,57 +1320,105 @@ def _run(args: argparse.Namespace) -> int:
         code, msg = _err(e)
         res["errors"].append({"stage": "auth", "code": code, "message": msg, "hint": HINT_CREDENTIALS})
         return finish(STATUS_ERROR)
-    log("계정 %s, 정리일 %s, 오늘(UTC) %s" % (res["account_id"], res["cleanup_date"], res["today_utc"]))
+    log("계정 %s, 모드 %s, 정리일 %s, 오늘(UTC) %s" % (res["account_id"], args.mode, res["cleanup_date"], res["today_utc"]))
 
     fatal = False
-    # Query whenever there is at least one full UTC day after cleanup: costs only grow as data
-    # posts, so a line found early is a real RESIDUAL even before settle-days have passed.
-    if window["end"]:
-        if pending:
-            log("판정 대기(%s) 중이지만 이미 지난 날짜는 조회합니다" % ", ".join(pending))
-        log("Cost Explorer 조회: %s ~ %s (UTC, End 제외 %s)" % (window["start"], window["end"], window["end_exclusive"]))
-        try:
-            ce = client(session, "ce", CE_REGION)
-            days, n = fetch_cost_and_usage(ce, window["start"], window["end_exclusive"],
-                                           record_filter(rf["mode"], rf["values"]))
-            res["ce_requests"] = n
-            window["queried"] = True
-            flagged, allowed, daily = analyze(days, args.threshold_usd, rules)
-            res["flagged"], res["allowed"], res["daily_totals"] = flagged, allowed, daily
-            if daily:
-                res["data_final"] = not any(d["estimated"] for d in daily)
-            # CE omits days it has not posted yet: the first post-cleanup day should be there.
-            start_day = dt.date.fromisoformat(window["start"])
-            if window["start"] not in days:
-                if now < _midnight(start_day + dt.timedelta(days=1)) + dt.timedelta(hours=NO_DATA_GRACE_HOURS):
-                    res["pending_reasons"].append("no-data")
-                else:
-                    res["warnings"].append("Cost Explorer가 %s 데이터를 돌려주지 않아 $0으로 간주" % window["start"])
-            elif args.require_final and days[max(days)]["estimated"]:
-                res["pending_reasons"].append("estimated")
-        except (ClientError, BotoCoreError, RuntimeError) as e:
-            fatal = True
-            info = classify_ce_error(e)
-            res["errors"].append(info)
-            log("Cost Explorer 오류: %s %s" % (info["code"], info["message"]))
-    else:
-        log("판정 대기: %s" % ", ".join(pending))
+    if not inventory_only:
+        fatal = _cost_step(args, session, res, window, rules, now, today)
 
-    if args.inventory:
+    if res["mode"] == MODE_INVENTORY or args.inventory:
         regions = resolve_inventory_regions(session, args, res["errors"])
-        log("인벤토리: %d개 리전 + S3" % len(regions))
+        log("인벤토리: %d개 리전 + global (%d개 리전 유형 + %d개 global 유형)" % (
+            len(regions), len(REGIONAL_CHECKS), len(GLOBAL_CHECKS) + 1))
         inv = run_inventory(session, regions, PROTECTED_PREFIXES + tuple(args.protect_prefix or ()))
         res.update({"inventory_ran": True, "inventory_regions": regions, "inventory": inv.counts,
-                    "inventory_items": inv.items, "inventory_protected": inv.protected,
-                    "inventory_unchecked": inv.unchecked})
+                    "inventory_items": inv.items, "examples": inv.examples(args.max_examples),
+                    "inventory_deleting": inv.deleting, "inventory_protected": inv.protected,
+                    "inventory_unchecked": inv.unchecked, "not_applicable": inv.not_applicable,
+                    "not_applicable_count": inv.not_applicable_count(), "blocked_by_policy": inv.blocked,
+                    "blocked_by_policy_count": inv.blocked_count(), "inventory_checked": inv.checked})
         res["errors"].extend(inv.errors)
-        res["inventory_complete"] = not any(
-            c != "NotAvailableInRegion" for per in inv.unchecked.values() for c in per.values())
-        inv_total = inv.total()
+        res["inventory_complete"] = not inv.unchecked and not inv.blocked
+        if not res["inventory_complete"] and res["mode"] == MODE_INVENTORY:
+            res["warnings"].append("일부 유형/리전을 확인하지 못했습니다(권한 차단 또는 오류). 해당 범위는 콘솔에서 확인하세요.")
+        inv_total, checked = inv.total(), inv.checked
     else:
-        inv_total = 0
+        inv_total, checked = 0, 0
 
+    if res["mode"] == MODE_INVENTORY:
+        return finish(decide_inventory(inv_total, checked))
     return finish(decide(res["flagged"], inv_total, fatal, res["pending_reasons"]))
+
+
+def _fallback_to_inventory(res: Dict[str, Any], e: Exception, reason: str) -> None:
+    info = classify_ce_error(e)
+    info["reason"] = reason
+    res["ce_fallback"] = info
+    res["mode"] = MODE_INVENTORY
+    res["pending_reasons"] = []
+    res["ce_requests"] = 0
+    res["warnings"].append(HINT_CE_FALLBACK)
+    log("Cost Explorer 사용 불가(%s: %s) → 인벤토리 모드로 판정" % (info["code"], reason))
+
+
+def _cost_step(args, session, res: Dict[str, Any], window: Dict[str, Any], rules: List[Dict[str, Any]],
+               now: dt.datetime, today: dt.date) -> bool:
+    """Run the Cost Explorer part. Returns fatal (True = CE error that is not a fallback case)."""
+    pending = res["pending_reasons"]
+    if not window["end"]:
+        log("판정 대기: %s" % ", ".join(pending))
+        if args.mode != MODE_AUTO:
+            return False
+        # auto: nothing to judge yet, but learn now whether CE is usable at all (1 request, $0.01),
+        # so accounts that can never use CE get an inventory verdict instead of an endless PENDING.
+        try:
+            res["ce_requests"] = probe_cost_explorer(client(session, "ce", CE_REGION), today)
+            res["ce_probe"] = "ok"
+        except (ClientError, BotoCoreError) as e:
+            reason = ce_fallback_reason(e)
+            if reason:
+                _fallback_to_inventory(res, e, reason)
+            else:
+                res["ce_probe"] = "error:%s" % _err(e)[0]
+                res["warnings"].append("Cost Explorer 사용 가능 여부 확인 실패: %s" % _err(e)[0])
+        return False
+
+    # Query whenever there is at least one full UTC day after cleanup: costs only grow as data
+    # posts, so a line found early is a real RESIDUAL even before settle-days have passed.
+    if pending:
+        log("판정 대기(%s) 중이지만 이미 지난 날짜는 조회합니다" % ", ".join(pending))
+    log("Cost Explorer 조회: %s ~ %s (UTC, End 제외 %s)" % (window["start"], window["end"], window["end_exclusive"]))
+    try:
+        ce = client(session, "ce", CE_REGION)
+        rf = res["record_filter"]
+        days, n = fetch_cost_and_usage(ce, window["start"], window["end_exclusive"],
+                                       record_filter(rf["mode"], rf["values"]))
+    except (ClientError, BotoCoreError, RuntimeError) as e:
+        reason = ce_fallback_reason(e) if args.mode == MODE_AUTO else None
+        if reason:
+            _fallback_to_inventory(res, e, reason)
+            return False
+        info = classify_ce_error(e)
+        res["errors"].append(info)
+        log("Cost Explorer 오류: %s %s" % (info["code"], info["message"]))
+        return True
+
+    res["ce_requests"] = n
+    window["queried"] = True
+    flagged, allowed, daily = analyze(days, args.threshold_usd, rules)
+    res["flagged"], res["allowed"], res["daily_totals"] = flagged, allowed, daily
+    if daily:
+        res["data_final"] = not any(d["estimated"] for d in daily)
+    # CE omits days it has not posted yet: the first post-cleanup day should be there.
+    start_day = dt.date.fromisoformat(window["start"])
+    if window["start"] not in days:
+        if now < _midnight(start_day + dt.timedelta(days=1)) + dt.timedelta(hours=NO_DATA_GRACE_HOURS):
+            pending.append("no-data")
+        else:
+            res["warnings"].append("Cost Explorer가 %s 데이터를 돌려주지 않아 $0으로 간주" % window["start"])
+    elif args.require_final and days[max(days)]["estimated"]:
+        pending.append("estimated")
+    return False
 
 
 if __name__ == "__main__":
